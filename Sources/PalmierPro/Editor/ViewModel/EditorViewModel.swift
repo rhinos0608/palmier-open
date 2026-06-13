@@ -54,6 +54,7 @@ final class EditorViewModel {
     var activeFrame: Int { playheadState.timelineFrame }
     var isPlaying: Bool = false
     var selectedClipIds: Set<String> = []
+    var isMarqueeSelecting: Bool = false
     var selectedGap: GapSelection?
     var selectedTimelineRange: TimelineRangeSelection?
     var selectedMediaAssetIds: Set<String> = []
