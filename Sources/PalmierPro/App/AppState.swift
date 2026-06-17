@@ -1,6 +1,10 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct ProjectOpenOptions {
+    var startTutorial = false
+}
+
 @Observable
 @MainActor
 final class AppState {
@@ -130,15 +134,22 @@ final class AppState {
         }
     }
 
-    func openProject(at url: URL) {
+    func openProject(at url: URL, register: Bool = true, options: ProjectOpenOptions = .init()) {
         do {
             let doc = try VideoProject(contentsOf: url, ofType: VideoProject.typeIdentifier)
             doc.makeWindowControllers()
             doc.showWindows()
             NSDocumentController.shared.addDocument(doc)
-            ProjectRegistry.shared.register(url)
+            if register { ProjectRegistry.shared.register(url) }
+            apply(options, to: doc.editorViewModel)
         } catch {
             NSAlert(error: error).runModal()
+        }
+    }
+
+    private func apply(_ options: ProjectOpenOptions, to editor: EditorViewModel) {
+        if options.startTutorial {
+            DispatchQueue.main.async { editor.tour.start(in: editor) }
         }
     }
 
