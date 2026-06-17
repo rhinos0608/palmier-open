@@ -304,7 +304,7 @@ struct AIEditTab: View {
             Button(title) {
                 present(action)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.capsule(.secondary))
             .controlSize(.small)
             .disabled(!isEnabled)
         }
