@@ -1,38 +1,32 @@
 <div align="center">
 
-# Palmier Pro
+# Palmier Open
 
-**The video editor built for AI.**
-
-<a href="https://github.com/palmier-io/palmier-pro/releases/latest/download/PalmierPro.dmg">
-  <img src="./assets/macos-badge.png" alt="Download palmierpro for macOS" width="180" />
-</a>
+**AI-native macOS video editor — fully open source.**
 
 <sub><i>Requires macOS 26 (Tahoe) on Apple Silicon</i></sub>
 
-<a href="https://x.com/Palmier_io"><img src="https://img.shields.io/badge/Follow-%40Palmier__io-000000?style=flat&logo=x&logoColor=white" alt="Follow on X" /></a>
-<a href="https://discord.com/invite/SMVW6pKYmg"><img src="https://img.shields.io/badge/Join-Discord-5865F2?style=flat&logo=discord&logoColor=white" alt="Join Discord" /></a>
-<a href="https://www.ycombinator.com/companies/palmier"><img src="https://img.shields.io/badge/Y%20Combinator-S24-orange" alt="Y Combinator S24" /></a>
-
 </div>
-
-<img src="./assets/palmier-ui.png" alt="palmierpro UI" width="900" />
 
 ---
 
-Palmier Pro is an open source video editor for Mac. You and your agent can generate and edit videos together inside the timeline.
+Palmier Open is a community fork of [Palmier Pro](https://github.com/palmier-io/palmier-pro), the excellent video editor built by the Palmier team. This fork removes the backend dependency and adds support for your own AI providers and local models.
 
-### Swift-native video editor
+All credit for the editor, timeline, MCP server, and Swift-native architecture goes to the [upstream Palmier team](https://github.com/palmier-io/palmier-pro).
 
-We built Palmier Pro from scratch with Swift. The north star is Premiere Pro, with our take on integrating AI into the workflow.
+### What's different from upstream
 
-### Built-in Generative AI
+- **No backend required.** Removed the Palmier account system, Clerk/Convex auth, and the closed-source generation backend.
+- **Bring your own provider.** Configure any OpenAI-compatible API (base URL + key) in Settings → Agent for chat, generation, TTS, upscale, music, and SFX.
+- **Local models.** Download and run models on-device via MLX. The app ships a Python MLX server and a model browser that pulls from HuggingFace.
+- **Fully open source.** Every line runs on your machine or against your own API keys.
 
-Generate videos and images with SOTA models like Seedance, Kling, Nano Banana Pro inside the timeline editor.
+### What's the same
 
-### Integrates with your agents
-
-Connects your Claude/Codex/Cursor via MCP, or use the in-app agent to work on the same project together.
+- Full Swift-native video editor with timeline, tracks, trimming, transforms, captions
+- MCP server so Claude Code, Codex, Cursor, and Claude Desktop can drive the timeline
+- In-app agent panel for chat-based editing
+- Generation UI for video, image, music, SFX, and upscale
 
 ## MCP server
 
@@ -50,9 +44,9 @@ codex mcp add palmier-pro --url http://127.0.0.1:19789/mcp
 
 **Cursor**
 
-The easiest way is go inside the app `Help` -> `MCP Instructions` -> `Install in Cursor`, or install manually by adding this to `~/.cursor/mcp.json`:
+Go inside the app `Help` → `MCP Instructions` → `Install in Cursor`, or add this to `~/.cursor/mcp.json`:
 
-```
+```json
 {
   "mcpServers": {
     "palmier-pro": {
@@ -65,49 +59,21 @@ The easiest way is go inside the app `Help` -> `MCP Instructions` -> `Install in
 
 **Claude Desktop**
 
-We bundle a [mcpb](https://github.com/modelcontextprotocol/mcpb) with the app that allows a one click install Desktop Extension on Claude Desktop. Go to `Help` -> `MCP Instructions` -> `Install in Claude Desktop`
-
-## FAQ
-
-**Is Palmier Pro fully open source?**
-
-The video editor (without the generative AI features) is fully open source. The MCP server and the agent chat are also open source. The only thing that is closed source is the generative AI processing.
-
-**Is it free?**
-
-The editor is free. You can download it with no login required, and use it as a video editor like CapCut or Adobe Premiere. You can also use the MCP server for free, and start experimenting using Claude Code/Desktop or Cursor to interact with your timeline editor.
-
-Generative AI features require login and subscription.
-
-**What platforms does it support?**
-
-macOS 26 (Tahoe) on Apple Silicon only.
-
-See [FAQ.md](FAQ.md) for more.
+Go to `Help` → `MCP Instructions` → `Install in Claude Desktop` for one-click install.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md)
+```bash
+swift build
+swift run
+```
 
-## Community &amp; Support
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- **Discord:** Join the community on **[Discord](https://discord.com/invite/SMVW6pKYmg)**.
-- **Twitter / X:** Follow **[@Palmier_io](https://x.com/Palmier_io)** for updates and announcements.
-- **Instagram:** Follow [@palmier.io](https://www.instagram.com/palmier.io) 
-- **Feedback &amp; Support:** Create a [Github Issue](https://github.com/palmier-io/palmier-pro/issues) or email us at founders@palmier.io
+## Credits
 
-## Star History
-
-<a href="https://www.star-history.com/?type=date&repos=palmier-io%2Fpalmier-pro">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=palmier-io/palmier-pro&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=palmier-io/palmier-pro&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=palmier-io/palmier-pro&type=date&legend=top-left" />
- </picture>
-</a>
+Built by the [Palmier team](https://github.com/palmier-io/palmier-pro) ([Y Combinator S24](https://www.ycombinator.com/companies/palmier)). This fork adapts their work for a fully local, provider-agnostic workflow.
 
 ## License
 
-Copyright (C) 2026 Palmier, Inc.
-
-Palmier Pro is open source under [GPLv3](LICENSE).
+Copyright (C) 2026 Palmier, Inc. Licensed under [GPLv3](LICENSE).
