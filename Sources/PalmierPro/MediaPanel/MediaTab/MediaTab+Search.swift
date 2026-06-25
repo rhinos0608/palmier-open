@@ -13,14 +13,14 @@ extension MediaTab {
                 if !visualHits.isEmpty {
                     momentHeader("Moments", icon: "sparkle.magnifyingglass", count: visualHits.count, collapsible: true)
                     if !collapsedSearchSections.contains("Moments") {
-                        resultsGrid { ForEach(visualHits.indices, id: \.self) { momentCard(visualHits[$0]) } }
+                        resultsGrid { ForEach(visualHits) { momentCard($0) } }
                     }
                 }
                 if !spokenHits.isEmpty {
                     momentHeader("Spoken", icon: "waveform", count: spokenHits.count, collapsible: true)
                     if !collapsedSearchSections.contains("Spoken") {
                         VStack(spacing: AppTheme.Spacing.sm) {
-                            ForEach(spokenHits.indices, id: \.self) { spokenRow(spokenHits[$0]) }
+                            ForEach(spokenHits) { spokenRow($0) }
                         }
                         .padding(.bottom, AppTheme.Spacing.sm)
                     }
@@ -218,7 +218,7 @@ extension MediaTab {
         momentSearchTask = Task {
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
-            let spoken = TranscriptSearch.search(query: query, assets: assets)
+            let spoken = await TranscriptSearch.search(query: query, assets: assets)
             let visual = await coordinator.search(query: query)
             guard !Task.isCancelled else { return }
             visualHits = visual

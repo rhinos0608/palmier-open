@@ -49,11 +49,13 @@ enum ExportResolution: String, CaseIterable, Identifiable {
 enum ExportError: LocalizedError {
     case unsupportedPreset
     case invalidFormat
+    case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .unsupportedPreset: "Export preset not supported on this system"
         case .invalidFormat: "Invalid export format"
+        case .writeFailed(let detail): "Export write failed: \(detail)"
         }
     }
 }
@@ -83,9 +85,18 @@ final class ExportService {
                 telemetry: "Export started",
                 data: ["format": "xml", "tracks": timeline.tracks.count, "clips": timeline.tracks.reduce(0) { $0 + $1.clips.count }]
             )
-            XMLExporter.export(timeline: timeline, resolver: resolver, outputURL: outputURL)
-            progress = 1.0
-            Log.export.notice("export ok format=xml", telemetry: "Export finished", data: ["format": "xml"])
+            do {
+                try XMLExporter.export(timeline: timeline, resolver: resolver, outputURL: outputURL)
+                progress = 1.0
+                Log.export.notice("export ok format=xml", telemetry: "Export finished", data: ["format": "xml"])
+            } catch {
+                self.error = Log.detail(error)
+                Log.export.error(
+                    "export xml write failed: \(Log.detail(error))",
+                    telemetry: "Export failed",
+                    data: ["format": "xml", "error": Log.detail(error)]
+                )
+            }
             return
         }
 

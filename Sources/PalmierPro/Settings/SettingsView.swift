@@ -1,9 +1,9 @@
 import SwiftUI
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case account
     case general
     case models
+    case localModels
     case agent
     case storage
 
@@ -11,9 +11,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .account: return "Account"
         case .general: return "General"
         case .models: return "Models"
+        case .localModels: return "Local AI"
         case .agent: return "Agent"
         case .storage: return "Storage"
         }
@@ -21,9 +21,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .account: return "person.circle"
         case .general: return "gearshape"
         case .models: return "square.stack.3d.up"
+        case .localModels: return "cpu"
         case .agent: return "paperplane"
         case .storage: return "internaldrive"
         }
@@ -31,18 +31,13 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
-    @Bindable private var account = AccountService.shared
     @State private var selectedTab: SettingsTab
 
-    init(initialTab: SettingsTab = .account) {
+    init(initialTab: SettingsTab = .general) {
         _selectedTab = State(initialValue: initialTab)
     }
 
-    private var visibleTabs: [SettingsTab] {
-        SettingsTab.allCases.filter { tab in
-            !(tab == .account && account.isMisconfigured)
-        }
-    }
+    private var visibleTabs: [SettingsTab] { SettingsTab.allCases }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -67,13 +62,9 @@ struct SettingsView: View {
 private struct SettingsSidebar: View {
     @Binding var selectedTab: SettingsTab
     let visibleTabs: [SettingsTab]
-    @Bindable private var account = AccountService.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !account.isMisconfigured {
-                IdentityStrip()
-            }
             tabList
             Spacer(minLength: 0)
         }
@@ -115,13 +106,45 @@ private struct SettingsDetail: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: AppTheme.Spacing.lg) {
                     switch tab {
-                    case .account:
-                        AccountPane()
                     case .general:
                         NotificationsPane()
                         PrivacyPane()
                     case .models:
                         ModelsPane()
+                    case .localModels:
+                        VStack(alignment: .leading, spacing: AppTheme.Spacing.lg) {
+                            SettingsToggleRow(
+                                title: "Enable Local AI",
+                                subtitle: "Run AI models locally on your Mac using MLX",
+                                isOn: Binding(
+                                    get: { ProviderConfig.isLocalAIEnabled },
+                                    set: { newValue in
+                                        ProviderConfig.isLocalAIEnabled = newValue
+                                        if !newValue {
+                                            // Clear all local model selections when disabling
+                                            for cat in ModelCategory.allCases {
+                                                ProviderConfig.setSelectedLocalModel(nil, for: cat)
+                                            }
+                                        }
+                                        Task {
+                                            if newValue {
+                                                await AppState.shared.startLocalServer()
+                                            } else {
+                                                AppState.shared.pythonServer.stop()
+                                            }
+                                        }
+                                    }
+                                )
+                            )
+
+                            if ProviderConfig.isLocalAIEnabled {
+                                LocalServerStatusView()
+                            }
+
+                            Divider()
+
+                            LocalModelsPanelView()
+                        }
                     case .agent:
                         AgentPane()
                     case .storage:
@@ -164,6 +187,31 @@ struct SettingsToggleRow: View {
     }
 }
 
+private struct LocalServerStatusView: View {
+    @ObservedObject private var server: PythonServerManager = AppState.shared.pythonServer
+
+    var body: some View {
+        HStack(spacing: AppTheme.Spacing.sm) {
+            Circle()
+                .fill(server.isRunning ? .green : .orange)
+                .frame(width: 8, height: 8)
+            Text(server.isRunning
+                 ? "Server running on port \(server.port)"
+                 : "Starting server...")
+                .font(.system(size: AppTheme.FontSize.sm))
+                .foregroundStyle(AppTheme.Text.secondaryColor)
+            Spacer()
+            Button("Stop") {
+                server.stop()
+            }
+            .controlSize(.small)
+        }
+        .padding(AppTheme.Spacing.md)
+        .background(AppTheme.Background.surfaceColor)
+        .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.sm))
+    }
+}
+
 @MainActor
 final class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
@@ -171,7 +219,12 @@ final class SettingsWindowController: NSWindowController {
     private var hosting: NSHostingController<AnyView>?
 
     private init() {
-        let initialView = SettingsView().tint(AppTheme.Accent.primary)
+        let state = AppState.shared
+        let initialView = SettingsView()
+            .environmentObject(state.modelRegistry)
+            .environmentObject(state.modelPool)
+            .environmentObject(state.modelDownloadManager)
+            .tint(AppTheme.Accent.primary)
         let hosting = NSHostingController(rootView: AnyView(initialView))
         let window = NSWindow(contentViewController: hosting)
         window.setContentSize(NSSize(width: 980, height: 640))
@@ -195,8 +248,12 @@ final class SettingsWindowController: NSWindowController {
 
     func show(tab: SettingsTab? = nil) {
         if let tab {
+            let state = AppState.shared
             hosting?.rootView = AnyView(
                 SettingsView(initialTab: tab)
+                    .environmentObject(state.modelRegistry)
+                    .environmentObject(state.modelPool)
+                    .environmentObject(state.modelDownloadManager)
                     .id(UUID())
                     .tint(AppTheme.Accent.primary)
             )
@@ -205,8 +262,4 @@ final class SettingsWindowController: NSWindowController {
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-}
-
-#Preview {
-    SettingsView()
 }

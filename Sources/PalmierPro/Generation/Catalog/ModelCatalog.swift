@@ -1,6 +1,4 @@
 import Foundation
-import Combine
-@preconcurrency import ConvexMobile
 
 enum ModelKind: Sendable {
     case video(VideoModelConfig)
@@ -13,7 +11,6 @@ enum ModelRegistry {
     @MainActor static var byId: [String: ModelKind] { ModelCatalog.shared.byId }
 
     @MainActor static func exists(id: String) -> Bool { byId[id] != nil }
-
 
     @MainActor static func displayName(for id: String) -> String {
         switch byId[id] {
@@ -39,63 +36,69 @@ final class ModelCatalog {
     private(set) var isLoaded: Bool = false
     private(set) var lastError: String?
 
-    @ObservationIgnored private var subscription: AnyCancellable?
-    @ObservationIgnored private var didConfigure = false
+    private var didConfigure = false
 
     private init() {}
 
     func configure() {
         guard !didConfigure else { return }
         didConfigure = true
-
-        guard let client = AccountService.shared.convex else { return }
-
-        subscription = client
-            .subscribe(to: "models:list", yielding: [CatalogEntry].self)
-            .receive(on: DispatchQueue.main)
-            .sink(
-                receiveCompletion: { [weak self] completion in
-                    if case .failure(let err) = completion {
-                        Log.generation.error("ModelCatalog subscription failed: \(err.localizedDescription)")
-                        self?.lastError = err.localizedDescription
-                    }
-                },
-                receiveValue: { [weak self] entries in
-                    self?.apply(entries)
-                }
-            )
+        Task { await rebuildFromDirectory() }
     }
 
-    private func apply(_ entries: [CatalogEntry]) {
+    func refresh() async {
+        let ok = await ModelDirectory.shared.refresh()
+        if ok { await rebuildFromDirectory() }
+    }
+
+    private func rebuildFromDirectory() async {
+        let directory = ModelDirectory.shared
+        guard directory.hasLoaded else {
+            lastError = "Model list not yet fetched. Open Settings → Agent and fetch models."
+            return
+        }
+
         var newVideo: [VideoModelConfig] = []
         var newImage: [ImageModelConfig] = []
         var newAudio: [AudioModelConfig] = []
         var newUpscale: [UpscaleModelConfig] = []
         var newById: [String: ModelKind] = [:]
-        newVideo.reserveCapacity(entries.count)
-        newImage.reserveCapacity(entries.count)
-        newAudio.reserveCapacity(entries.count)
-        newUpscale.reserveCapacity(entries.count)
-        newById.reserveCapacity(entries.count)
 
-        for entry in entries {
-            switch entry.uiCapabilities {
-            case .video(let caps):
+        for model in directory.models {
+            let entry = CatalogEntry(from: model)
+            switch model.kind {
+            case .video:
+                let caps = VideoCaps.defaults
                 let m = VideoModelConfig(entry: entry, caps: caps)
                 newVideo.append(m)
                 newById[m.id] = .video(m)
-            case .image(let caps):
+            case .image:
+                let caps = ImageCaps.defaults
                 let m = ImageModelConfig(entry: entry, caps: caps)
                 newImage.append(m)
                 newById[m.id] = .image(m)
-            case .audio(let caps):
+            case .tts, .transcription:
+                let caps = AudioCaps.defaults(for: .tts)
                 let m = AudioModelConfig(entry: entry, caps: caps)
                 newAudio.append(m)
                 newById[m.id] = .audio(m)
-            case .upscale(let caps):
+            case .music:
+                let caps = AudioCaps.defaults(for: .music)
+                let m = AudioModelConfig(entry: entry, caps: caps)
+                newAudio.append(m)
+                newById[m.id] = .audio(m)
+            case .sfx:
+                let caps = AudioCaps.defaults(for: .sfx)
+                let m = AudioModelConfig(entry: entry, caps: caps)
+                newAudio.append(m)
+                newById[m.id] = .audio(m)
+            case .upscale:
+                let caps = UpscaleCaps.defaults
                 let m = UpscaleModelConfig(entry: entry, caps: caps)
                 newUpscale.append(m)
                 newById[m.id] = .upscale(m)
+            case .chat, .embedding, .other:
+                continue
             }
         }
 
@@ -109,90 +112,37 @@ final class ModelCatalog {
     }
 }
 
-struct CatalogEntry: Decodable, Sendable {
+// MARK: - CatalogEntry (simplified — no longer Convex-driven)
+
+struct CatalogEntry: Sendable {
     let id: String
-    let kind: Kind
     let displayName: String
-    let allowedEndpoints: [String]
-    let responseShape: ResponseShape
-    let uiCapabilities: UICapabilities
     let creditsPerSecond: [String: Double]?
     let audioDiscountRate: [String: Double]?
     let creditsPerImage: [String: Double]?
-    let qualities: [String]?
     let audioPricing: AudioPricing?
     let creditsPerSecondUpscale: Double?
 
-    enum Kind: String, Decodable, Sendable { case video, image, audio, upscale }
-    enum ResponseShape: String, Decodable, Sendable {
-        case video, images, audio, upscaledImage
+    init(from model: ProviderModel) {
+        self.id = model.id
+        self.displayName = model.id
+        self.creditsPerSecond = nil
+        self.audioDiscountRate = nil
+        self.creditsPerImage = nil
+        self.audioPricing = nil
+        self.creditsPerSecondUpscale = nil
     }
 
-    enum UICapabilities: Sendable {
-        case video(VideoCaps)
-        case image(ImageCaps)
-        case audio(AudioCaps)
-        case upscale(UpscaleCaps)
-    }
-
-    enum AudioPricing: Decodable, Sendable {
+    enum AudioPricing: Sendable {
         case perThousandChars(rate: Double)
         case perSecond(rate: Double)
         case flat(price: Double)
-
-        private enum K: String, CodingKey { case mode, rate, price }
-
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: K.self)
-            switch try c.decode(String.self, forKey: .mode) {
-            case "perThousandChars":
-                self = .perThousandChars(rate: try c.decode(Double.self, forKey: .rate))
-            case "perSecond":
-                self = .perSecond(rate: try c.decode(Double.self, forKey: .rate))
-            case "flat":
-                self = .flat(price: try c.decode(Double.self, forKey: .price))
-            default:
-                throw DecodingError.dataCorruptedError(
-                    forKey: .mode, in: c,
-                    debugDescription: "Unknown audio pricing mode"
-                )
-            }
-        }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, kind, displayName, allowedEndpoints, responseShape, uiCapabilities
-        case creditsPerSecond, audioDiscountRate, creditsPerImage, qualities
-        case audioPricing, creditsPerSecondUpscale
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try c.decode(String.self, forKey: .id)
-        self.kind = try c.decode(Kind.self, forKey: .kind)
-        self.displayName = try c.decode(String.self, forKey: .displayName)
-        self.allowedEndpoints = try c.decode([String].self, forKey: .allowedEndpoints)
-        self.responseShape = try c.decode(ResponseShape.self, forKey: .responseShape)
-        self.creditsPerSecond = try c.decodeIfPresent([String: Double].self, forKey: .creditsPerSecond)
-        self.audioDiscountRate = try c.decodeIfPresent([String: Double].self, forKey: .audioDiscountRate)
-        self.creditsPerImage = try c.decodeIfPresent([String: Double].self, forKey: .creditsPerImage)
-        self.qualities = try c.decodeIfPresent([String].self, forKey: .qualities)
-        self.audioPricing = try c.decodeIfPresent(AudioPricing.self, forKey: .audioPricing)
-        self.creditsPerSecondUpscale = try c.decodeIfPresent(Double.self, forKey: .creditsPerSecondUpscale)
-        switch self.kind {
-        case .video:
-            self.uiCapabilities = .video(try c.decode(VideoCaps.self, forKey: .uiCapabilities))
-        case .image:
-            self.uiCapabilities = .image(try c.decode(ImageCaps.self, forKey: .uiCapabilities))
-        case .audio:
-            self.uiCapabilities = .audio(try c.decode(AudioCaps.self, forKey: .uiCapabilities))
-        case .upscale:
-            self.uiCapabilities = .upscale(try c.decode(UpscaleCaps.self, forKey: .uiCapabilities))
-        }
     }
 }
 
-struct VideoCaps: Decodable, Sendable {
+// MARK: - Capability structs with static defaults
+
+struct VideoCaps: Sendable {
     let durations: [Int]
     let resolutions: [String]?
     let aspectRatios: [String]
@@ -208,18 +158,44 @@ struct VideoCaps: Decodable, Sendable {
     let referenceTagNoun: String
     let requiresSourceVideo: Bool
     let requiresReferenceImage: Bool
+
+    static let defaults = VideoCaps(
+        durations: GenerationCapabilities.videoDurations,
+        resolutions: GenerationCapabilities.videoSizes,
+        aspectRatios: ["16:9", "9:16", "1:1"],
+        supportsFirstFrame: false,
+        supportsLastFrame: false,
+        maxReferenceImages: 1,
+        maxReferenceVideos: 0,
+        maxReferenceAudios: 0,
+        maxTotalReferences: 1,
+        maxCombinedVideoRefSeconds: nil,
+        maxCombinedAudioRefSeconds: nil,
+        framesAndReferencesExclusive: true,
+        referenceTagNoun: "image",
+        requiresSourceVideo: false,
+        requiresReferenceImage: false
+    )
 }
 
-struct ImageCaps: Decodable, Sendable {
+struct ImageCaps: Sendable {
     let resolutions: [String]?
     let aspectRatios: [String]
     let qualities: [String]?
     let supportsImageReference: Bool
     let maxImages: Int
+
+    static let defaults = ImageCaps(
+        resolutions: GenerationCapabilities.imageSizes,
+        aspectRatios: ["1:1", "16:9", "9:16"],
+        qualities: GenerationCapabilities.imageQualities,
+        supportsImageReference: false,
+        maxImages: GenerationCapabilities.imageMaxN
+    )
 }
 
-struct AudioCaps: Decodable, Sendable {
-    let category: String   // "tts" | "music" | "sfx"
+struct AudioCaps: Sendable {
+    let category: String
     let voices: [String]?
     let defaultVoice: String?
     let supportsLyrics: Bool
@@ -227,14 +203,70 @@ struct AudioCaps: Decodable, Sendable {
     let supportsStyleInstructions: Bool
     let durations: [Int]?
     let minPromptLength: Int
-    let inputs: [String]? // "text" | "video"
+    let inputs: [String]?
     let promptLabel: String?
     let minSeconds: Int?
     let maxSeconds: Int?
+
+    static func defaults(for category: AudioModelConfig.Category) -> AudioCaps {
+        switch category {
+        case .tts:
+            return AudioCaps(
+                category: "tts",
+                voices: GenerationCapabilities.ttsVoices,
+                defaultVoice: GenerationCapabilities.ttsDefaultVoice,
+                supportsLyrics: false,
+                supportsInstrumental: false,
+                supportsStyleInstructions: true,
+                durations: nil,
+                minPromptLength: 1,
+                inputs: ["text"],
+                promptLabel: "Text to speak",
+                minSeconds: 1,
+                maxSeconds: 60
+            )
+        case .music:
+            return AudioCaps(
+                category: "music",
+                voices: nil,
+                defaultVoice: nil,
+                supportsLyrics: false,
+                supportsInstrumental: true,
+                supportsStyleInstructions: true,
+                durations: GenerationCapabilities.musicDurations,
+                minPromptLength: 1,
+                inputs: ["text"],
+                promptLabel: "Describe the music style or mood",
+                minSeconds: GenerationCapabilities.musicDurations.first ?? 8,
+                maxSeconds: GenerationCapabilities.musicDurations.last ?? 60
+            )
+        case .sfx:
+            return AudioCaps(
+                category: "sfx",
+                voices: nil,
+                defaultVoice: nil,
+                supportsLyrics: false,
+                supportsInstrumental: false,
+                supportsStyleInstructions: false,
+                durations: GenerationCapabilities.sfxDurations,
+                minPromptLength: 1,
+                inputs: ["text"],
+                promptLabel: "Describe the sound effect",
+                minSeconds: GenerationCapabilities.sfxDurations.first ?? 1,
+                maxSeconds: GenerationCapabilities.sfxDurations.last ?? 10
+            )
+        }
+    }
 }
 
-struct UpscaleCaps: Decodable, Sendable {
-    let speed: String   // "Fast" | "Medium" | "Slow"
+struct UpscaleCaps: Sendable {
+    let speed: String
     let p75DurationSeconds: Int
-    let supportedTypes: [String]   // "video" | "image"
+    let supportedTypes: [String]
+
+    static let defaults = UpscaleCaps(
+        speed: "Medium",
+        p75DurationSeconds: 30,
+        supportedTypes: ["image", "video"]
+    )
 }

@@ -18,6 +18,7 @@ final class SearchIndexCoordinator {
 
     private var queue: [String] = []
     private var failedIds: Set<String> = []
+    private var indexingInFlight: Set<String> = []
     private var worker: Task<Void, Never>?
     /// Bumped whenever `worker` is replaced or cancelled, so a stale worker's
     /// exit path can't clobber the reference to a newer one.
@@ -106,7 +107,7 @@ final class SearchIndexCoordinator {
 
     func schedule(_ asset: MediaAsset) {
         guard VisualModelLoader.shared.enabled, let model = VisualModelLoader.shared.embedder, !asset.isGenerating else { return }
-        guard !queue.contains(asset.id), !failedIds.contains(asset.id) else { return }
+        guard !queue.contains(asset.id), !failedIds.contains(asset.id), !indexingInFlight.contains(asset.id) else { return }
         let needsVisual = (asset.type == .video || asset.type == .image)
             && VisualIndexer.needsIndex(url: asset.url, spec: model.spec)
         guard needsVisual || needsTranscript(asset) else { return }
@@ -130,6 +131,7 @@ final class SearchIndexCoordinator {
         worker = nil
         queue.removeAll()
         resetBatch()
+        indexingInFlight.removeAll()
         current?.cancel()
         await current?.value
     }
@@ -162,7 +164,10 @@ final class SearchIndexCoordinator {
     private func dequeue() -> MediaAsset? {
         while !queue.isEmpty {
             let id = queue.removeFirst()
-            if let asset = assetsProvider().first(where: { $0.id == id }) { return asset }
+            if let asset = assetsProvider().first(where: { $0.id == id }) {
+                indexingInFlight.insert(id)
+                return asset
+            }
             batchCompleted += 1
         }
         resetBatch()
@@ -176,7 +181,10 @@ final class SearchIndexCoordinator {
     }
 
     private func indexOne(_ asset: MediaAsset) async {
-        defer { batchCompleted += 1 }
+        defer {
+            batchCompleted += 1
+            indexingInFlight.remove(asset.id)
+        }
         guard let model = VisualModelLoader.shared.embedder else { return }
         let transcribe = needsTranscript(asset)
         let visualShare = transcribe ? 0.5 : 1.0
@@ -203,7 +211,9 @@ final class SearchIndexCoordinator {
             default:
                 break
             }
-            loadedIndexes[asset.id] = nil
+            if let key = EmbeddingStore.key(for: url), let index = try? EmbeddingStore.load(key: key) {
+                loadedIndexes[asset.id] = (key, index)
+            }
             let visualSeconds = start.duration(to: .now).seconds
             currentAssetFraction = visualShare
             try await transcriptDone

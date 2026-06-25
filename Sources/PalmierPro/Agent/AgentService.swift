@@ -6,79 +6,66 @@ import Observation
 final class AgentService {
 
     private var apiKey: String = ""
-    private var apiKeyObserver: NSObjectProtocol?
+    private var baseURL: String = ""
+    private var configObserver: NSObjectProtocol?
 
     init() {
-        reloadAPIKey()
-        apiKeyObserver = NotificationCenter.default.addObserver(
-            forName: .anthropicAPIKeyChanged,
+        reloadConfig()
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .providerConfigChanged,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.reloadAPIKey()
+                self?.reloadConfig()
             }
         }
     }
 
-    private func reloadAPIKey() {
+    private func reloadConfig() {
         Task { [weak self] in
-            let key = await Task.detached(priority: .utility) {
-                AnthropicKeychain.load() ?? ""
+            let snapshot = await Task.detached(priority: .utility) {
+                (key: ProviderConfig.apiKey, base: ProviderConfig.baseURL, model: ProviderConfig.chatModel)
             }.value
-            self?.apiKey = key
+            guard let self else { return }
+            self.apiKey = snapshot.key
+            self.baseURL = snapshot.base
+            if self.model != snapshot.model { self.model = snapshot.model }
         }
     }
 
     isolated deinit {
-        if let token = apiKeyObserver {
+        if let token = configObserver {
             NotificationCenter.default.removeObserver(token)
         }
     }
 
-    var hasApiKey: Bool { !apiKey.isEmpty }
+    var isConfigured: Bool { !apiKey.isEmpty && !baseURL.isEmpty }
 
-    var canStream: Bool {
-        if hasApiKey { return true }
-        let account = AccountService.shared
-        return account.isSignedIn && account.hasCredits
-    }
+    var canStream: Bool { isConfigured && !model.isEmpty }
 
-    var availableModels: [AnthropicModel] {
-        if hasApiKey { return AnthropicModel.allCases }
-        return AccountService.shared.isPaid ? [.sonnet46] : [.haiku45]
+    var availableModels: [String] {
+        let chat = ModelDirectory.shared.chatModels.map(\.id)
+        if chat.isEmpty, !model.isEmpty { return [model] }
+        return chat
     }
 
     private func selectClient() -> (any AgentClient)? {
-        let chosen = effectiveModel
-        if hasApiKey { return AnthropicClient(apiKey: apiKey, model: chosen) }
-        if AccountService.shared.isSignedIn {
-            return PalmierClient(model: chosen)
-        }
-        return nil
+        guard isConfigured, !model.isEmpty else { return nil }
+        return OpenAIClient(baseURL: baseURL, apiKey: apiKey, model: model)
     }
 
-    var effectiveModel: AnthropicModel {
-        let available = availableModels
-        if available.contains(model) { return model }
-        return available.first ?? .sonnet46
-    }
-
-    var model: AnthropicModel = {
-        if let raw = UserDefaults.standard.string(forKey: "agentModel"),
-           let m = AnthropicModel(rawValue: raw) {
-            return m
+    var model: String = ProviderConfig.chatModel {
+        didSet {
+            if model != oldValue { ProviderConfig.setChatModel(model) }
         }
-        return .sonnet46
-    }() {
-        didSet { UserDefaults.standard.set(model.rawValue, forKey: "agentModel") }
     }
 
     var sessions: [ChatSession] = []
     var currentSessionId: UUID?
     var messages: [AgentMessage] = []
     var isStreaming: Bool = false
-    var streamError: PalmierClientError?
+    var streamError: AgentStreamError?
     var onSessionsChanged: (@MainActor () -> Void)?
 
     var draft: String = ""
@@ -271,6 +258,8 @@ final class AgentService {
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         sessions[idx].isOpen = false
         if currentSessionId == id {
+            currentTask?.cancel()
+            syncMessagesIntoCurrentSession()
             if let next = sessions.first(where: { $0.isOpen }) {
                 currentSessionId = next.id
                 messages = next.messages
@@ -285,6 +274,7 @@ final class AgentService {
     func deleteSession(_ id: UUID) {
         sessions.removeAll { $0.id == id }
         if currentSessionId == id {
+            currentTask?.cancel()
             currentSessionId = sessions.first(where: { $0.isOpen })?.id
             messages = currentSessionId
                 .flatMap { id in sessions.first { $0.id == id }?.messages }
@@ -295,8 +285,12 @@ final class AgentService {
     }
 
     func send(text: String, mentions: [AgentMention]) {
-        guard canStream else {
-            streamError = .upstream("Sign in to a paid plan or add an Anthropic API key to start.")
+        guard isConfigured else {
+            streamError = .notConfigured
+            return
+        }
+        guard !model.isEmpty else {
+            streamError = .streamError("Select a chat model in Settings → Agent.")
             return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -340,11 +334,11 @@ final class AgentService {
 
     private func runLoop() async {
         guard let client = selectClient() else {
-            streamError = .upstream("No backend available.")
+            streamError = .notConfigured
             return
         }
         let tools = ToolDefinitions.all.map {
-            AnthropicToolSchema(name: $0.name.rawValue, description: $0.description, inputSchema: $0.inputSchema)
+            AgentToolSchema(name: $0.name.rawValue, description: $0.description, inputSchema: $0.inputSchema)
         }
 
         loop: while !Task.isCancelled {
@@ -361,7 +355,7 @@ final class AgentService {
                     messages: apiMsgs
                 )
 
-                var stopReason: AnthropicStopReason = .endTurn
+                var stopReason: AgentStopReason = .endTurn
 
                 for try await event in stream {
                     try Task.checkCancellation()
@@ -383,13 +377,13 @@ final class AgentService {
             } catch is CancellationError {
                 dropEmptyAssistantTurn(id: assistantID)
                 break loop
-            } catch let err as PalmierClientError {
+            } catch let err as AgentStreamError {
                 dropEmptyAssistantTurn(id: assistantID)
                 streamError = err
                 break loop
             } catch {
                 dropEmptyAssistantTurn(id: assistantID)
-                streamError = .upstream(error.localizedDescription)
+                streamError = .streamError(error.localizedDescription)
                 break loop
             }
         }
@@ -511,19 +505,107 @@ final class AgentService {
         }
     }
 
-    private func apiMessages() -> [AnthropicMessage] {
-        messages.compactMap { msg in
-            var content = msg.blocks.compactMap(Self.contentBlockJSON)
-            if msg.role == .user, !msg.mentions.isEmpty {
-                let inlined = inlineImageBlocks(for: msg.mentions)
-                let hint = msg.contextHint
-                    ?? AgentMentionContext.hint(msg.mentions, editor: editor, inlined: inlined)
-                content.insert(contentsOf: inlined.blocks, at: 0)
-                content.insert(["type": "text", "text": hint], at: 0)
+    private func apiMessages() -> [AgentWireMessage] {
+        var out: [AgentWireMessage] = []
+        for msg in messages {
+            switch msg.role {
+            case .assistant:
+                if let wire = Self.assistantWire(msg) { out.append(wire) }
+            case .user:
+                if msg.blocks.contains(where: { if case .toolResult = $0 { return true }; return false }) {
+                    out.append(contentsOf: Self.toolResultWire(msg))
+                } else if let wire = userPromptWire(msg) {
+                    out.append(wire)
+                }
             }
-            guard !content.isEmpty else { return nil }
-            return AnthropicMessage(role: msg.role == .user ? .user : .assistant, content: content)
         }
+        return out
+    }
+
+    private static func assistantWire(_ msg: AgentMessage) -> AgentWireMessage? {
+        var text = ""
+        var toolCalls: [[String: Any]] = []
+        for block in msg.blocks {
+            switch block {
+            case .text(let s): text += s
+            case .toolUse(let id, let name, let inputJSON):
+                toolCalls.append([
+                    "id": id,
+                    "type": "function",
+                    "function": ["name": name, "arguments": inputJSON.isEmpty ? "{}" : inputJSON],
+                ])
+            case .toolResult: break
+            }
+        }
+        var dict: [String: Any] = ["role": "assistant"]
+        if !text.isEmpty {
+            dict["content"] = text
+        } else if toolCalls.isEmpty {
+            return nil
+        } else {
+            dict["content"] = NSNull()
+        }
+        if !toolCalls.isEmpty { dict["tool_calls"] = toolCalls }
+        return AgentWireMessage(json: dict)
+    }
+
+    private static func toolResultWire(_ msg: AgentMessage) -> [AgentWireMessage] {
+        var out: [AgentWireMessage] = []
+        var imageParts: [[String: Any]] = []
+        for block in msg.blocks {
+            guard case let .toolResult(toolUseId, content, _) = block else { continue }
+            var text = ""
+            for item in content {
+                switch item {
+                case .text(let s):
+                    text += text.isEmpty ? s : "\n" + s
+                case .image(let base64, let mime):
+                    imageParts.append([
+                        "type": "image_url",
+                        "image_url": ["url": "data:\(mime);base64,\(base64)"],
+                    ])
+                }
+            }
+            if text.isEmpty { text = imageParts.isEmpty ? "(no output)" : "(see attached image)" }
+            out.append(AgentWireMessage(json: [
+                "role": "tool",
+                "tool_call_id": toolUseId,
+                "content": text,
+            ]))
+        }
+        if !imageParts.isEmpty {
+            var parts: [[String: Any]] = [["type": "text", "text": "Tool result images:"]]
+            parts.append(contentsOf: imageParts)
+            out.append(AgentWireMessage(json: ["role": "user", "content": parts]))
+        }
+        return out
+    }
+
+    private func userPromptWire(_ msg: AgentMessage) -> AgentWireMessage? {
+        var text = ""
+        for block in msg.blocks {
+            if case let .text(s) = block { text += s }
+        }
+
+        var imageParts: [[String: Any]] = []
+        var hint: String?
+        if !msg.mentions.isEmpty {
+            let inlined = inlineImageBlocks(for: msg.mentions)
+            hint = msg.contextHint ?? AgentMentionContext.hint(msg.mentions, editor: editor, inlined: inlined)
+            imageParts = inlined.blocks
+        }
+
+        if imageParts.isEmpty, hint?.isEmpty ?? true {
+            guard !text.isEmpty else { return nil }
+            return AgentWireMessage(json: ["role": "user", "content": text])
+        }
+
+        var parts: [[String: Any]] = []
+        if let hint, !hint.isEmpty { parts.append(["type": "text", "text": hint]) }
+        parts.append(contentsOf: imageParts)
+        if !text.isEmpty { parts.append(["type": "text", "text": text]) }
+        guard !parts.isEmpty else { return nil }
+        return AgentWireMessage(json: ["role": "user", "content": parts])
     }
 
     private func inlineImageBlocks(for mentions: [AgentMention]) -> AgentMentionContext.InlinedMentions {
@@ -545,37 +627,12 @@ final class AgentService {
                 continue
             }
             out.blocks.append([
-                "type": "image",
-                "source": ["type": "base64", "media_type": encoded.mime, "data": encoded.data.base64EncodedString()],
+                "type": "image_url",
+                "image_url": ["url": "data:\(encoded.mime);base64,\(encoded.data.base64EncodedString())"],
             ])
             out.inlinedIds.insert(mediaRef)
         }
         return out
-    }
-
-    private static func contentBlockJSON(_ block: AgentContentBlock) -> [String: Any]? {
-        switch block {
-        case .text(let s):
-            guard !s.isEmpty else { return nil }
-            return ["type": "text", "text": s]
-        case .toolUse(let id, let name, let inputJSON):
-            return [
-                "type": "tool_use", "id": id, "name": name,
-                "input": parseJSONObject(inputJSON),
-            ]
-        case .toolResult(let toolUseId, let content, let isError):
-            let contentJSON: [[String: Any]] = content.map {
-                switch $0 {
-                case .text(let s): return ["type": "text", "text": s]
-                case .image(let base64, let mime):
-                    return ["type": "image", "source": ["type": "base64", "media_type": mime, "data": base64]]
-                }
-            }
-            return [
-                "type": "tool_result", "tool_use_id": toolUseId,
-                "content": contentJSON, "is_error": isError,
-            ]
-        }
     }
 
     private static func title(from message: AgentMessage) -> String {

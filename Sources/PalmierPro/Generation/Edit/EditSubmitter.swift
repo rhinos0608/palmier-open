@@ -15,7 +15,7 @@ enum EditSubmitter {
         onComplete: (@MainActor (MediaAsset) -> Void)? = nil,
         onFailure: (@MainActor () -> Void)? = nil
     ) -> String? {
-        guard AccountService.shared.isSignedIn else { return nil }
+        guard ProviderConfig.isConfigured(for: .upscale) else { return nil }
 
         let effectiveDuration: Int = {
             if let trim = trimmedSource, trim.hasTrim {
@@ -75,7 +75,7 @@ enum EditSubmitter {
         case unknownModel(String)
         case missingSource
         case invalid(String)
-        case unauthorized
+        case providerNotConfigured
 
         var errorDescription: String? {
             switch self {
@@ -83,7 +83,7 @@ enum EditSubmitter {
             case .unknownModel(let id): "Model no longer available: \(id)"
             case .missingSource: "Cannot rerun: source not recorded"
             case .invalid(let msg): msg
-            case .unauthorized: "Subscribe to Palmier to rerun generations"
+            case .providerNotConfigured: "Configure an AI provider in Settings to rerun generations"
             }
         }
     }
@@ -95,14 +95,71 @@ enum EditSubmitter {
         onComplete: (@MainActor (MediaAsset) -> Void)? = nil,
         onFailure: (@MainActor () -> Void)? = nil
     ) throws -> String {
-        guard AccountService.shared.isSignedIn else {
-            throw RerunError.unauthorized
+        guard ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled else {
+            throw RerunError.providerNotConfigured
         }
         guard let stored = asset.generationInput else { throw RerunError.notGenerated }
         var gen = stored
         gen.createdAt = nil
         let modelId = gen.model
         let preUploaded = gen.imageURLs
+
+        // Local model rerun — skip catalog validation, submit via asset type directly.
+        let modelIdentifier = ModelID(string: modelId)
+        if modelIdentifier.isLocal {
+            let isImage = asset.type == .image
+            let placeholderDuration: Double = isImage
+                ? Defaults.imageDurationSeconds
+                : (asset.duration > 0 ? asset.duration : Double(max(1, gen.duration)))
+            return editor.generationService.generate(
+                genInput: gen,
+                assetType: asset.type,
+                placeholderDuration: placeholderDuration,
+                references: [],
+                preUploadedURLs: preUploaded,
+                name: rerunName(for: asset),
+                folderId: asset.folderId,
+                buildParams: { uploaded in
+                    switch asset.type {
+                    case .image:
+                        .image(ImageGenerationParams(
+                            prompt: gen.prompt, aspectRatio: gen.aspectRatio,
+                            resolution: gen.resolution, quality: gen.quality,
+                            imageURLs: uploaded, numImages: gen.numImages ?? 1
+                        ))
+                    case .video:
+                        .video(VideoGenerationParams(
+                            prompt: gen.prompt, duration: gen.duration,
+                            aspectRatio: gen.aspectRatio, resolution: gen.resolution,
+                            sourceVideoURL: uploaded.first,
+                            startFrameURL: nil, endFrameURL: nil,
+                            referenceImageURLs: Array(uploaded.dropFirst()),
+                            generateAudio: gen.generateAudio ?? true
+                        ))
+                    case .audio:
+                        .audio(AudioGenerationParams(
+                            prompt: gen.prompt, voice: gen.voice,
+                            lyrics: gen.lyrics, styleInstructions: gen.styleInstructions,
+                            instrumental: gen.instrumental ?? false,
+                            durationSeconds: gen.duration > 0 ? gen.duration : nil,
+                            videoURL: preUploaded?.first
+                        ))
+                    case .text, .lottie:
+                        // Unreachable — asset.type validated above
+                        .image(ImageGenerationParams(
+                            prompt: gen.prompt, aspectRatio: gen.aspectRatio,
+                            resolution: gen.resolution, quality: gen.quality,
+                            imageURLs: uploaded, numImages: gen.numImages ?? 1
+                        ))
+                    }
+                },
+                fileExtension: isImage ? "jpg" : "mp4",
+                projectURL: editor.projectURL,
+                editor: editor,
+                onComplete: onComplete,
+                onFailure: onFailure
+            )
+        }
 
         if let videoModel = VideoModelConfig.allModels.first(where: { $0.id == modelId }) {
             if let err = videoModel.validate(

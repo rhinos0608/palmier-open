@@ -14,6 +14,24 @@ final class AppState {
 
     private(set) var mcpService: MCPService?
 
+    let modelRegistry: LocalModelRegistry
+    let modelPool = ModelPool()
+    let modelDownloadManager: ModelDownloadManager
+    let pythonServer = PythonServerManager()
+    let localAdapter: LocalInferenceAdapter
+
+    init() {
+        modelRegistry = LocalModelRegistry()
+        modelDownloadManager = ModelDownloadManager(registry: modelRegistry, hfClient: HuggingFaceClient())
+        localAdapter = LocalInferenceAdapter(serverManager: pythonServer)
+        GenerationProvider.localAdapter = localAdapter
+    }
+
+    func startLocalServer() async {
+        guard ProviderConfig.isLocalAIEnabled else { return }
+        await pythonServer.start()
+    }
+
     func startMCPService() {
         guard mcpService == nil else { return }
         guard MCPService.isEnabledPreference else {

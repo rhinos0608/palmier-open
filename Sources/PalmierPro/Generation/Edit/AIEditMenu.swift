@@ -42,8 +42,7 @@ struct AIEditMenu: View {
     }
 
     private var aiAllowed: Bool {
-        let account = AccountService.shared
-        return account.isSignedIn && !account.isMisconfigured
+        return ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled
     }
 
     private var availableActions: [EditAction] {

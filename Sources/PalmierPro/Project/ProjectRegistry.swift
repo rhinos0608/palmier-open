@@ -112,14 +112,28 @@ final class ProjectRegistry {
     }
 
     fileprivate nonisolated static func loadEntries(from fileURL: URL) -> [ProjectEntry] {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([ProjectEntry].self, from: data) else { return [] }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            Log.project.warning("Could not read registry data from \(fileURL.path)")
+            return []
+        }
+        guard let decoded = try? JSONDecoder().decode([ProjectEntry].self, from: data) else {
+            Log.project.warning("Could not decode registry from \(fileURL.path) (\(data.count) bytes)")
+            return []
+        }
         return decoded
     }
 
     fileprivate nonisolated static func saveEntries(_ entries: [ProjectEntry], to fileURL: URL) {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        guard let data = try? JSONEncoder().encode(entries) else {
+            Log.project.error("Could not encode registry entries")
+            return
+        }
+        do {
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            Log.project.error("Could not write registry to \(fileURL.path): \(error.localizedDescription)")
+        }
     }
 }
 

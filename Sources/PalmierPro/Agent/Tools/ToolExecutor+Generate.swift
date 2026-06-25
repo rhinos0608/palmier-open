@@ -3,19 +3,24 @@ import Foundation
 extension ToolExecutor {
     func generate(_ editor: EditorViewModel, _ args: [String: Any], type: ClipType) throws -> ToolResult {
         let prompt = try args.requireString("prompt")
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Generation requires signing in to Palmier. Tell the user to sign in.")
-        }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
+        guard ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled else {
+            throw ToolError("Generation requires an AI provider. Configure a base URL, API key, or enable Local AI in Settings.")
         }
         switch type {
         case .video:
-            guard let modelId = args.string("model") ?? VideoModelConfig.allModels.first?.id else {
-                throw ToolError("Model catalog not loaded yet. Try again in a moment.")
+            let modelString = args.string("model") ?? (VideoModelConfig.allModels.first?.id ?? "sora-2")
+            let modelId = ModelID(string: modelString)
+            if modelId.isLocal {
+                let localModel = VideoModelConfig(
+                    entry: CatalogEntry(from: ProviderModel(id: modelString, kind: .video)),
+                    caps: VideoCaps.defaults
+                )
+                return args.string("sourceVideoMediaRef") != nil
+                    ? try generateVideoEdit(editor, args, prompt: prompt, model: localModel)
+                    : try generateVideoText(editor, args, prompt: prompt, model: localModel)
             }
-            guard let model = VideoModelConfig.allModels.first(where: { $0.id == modelId }) else {
-                throw ToolError("Unknown model '\(modelId)'. Available: \(VideoModelConfig.allModels.map(\.id).joined(separator: ", "))")
+            guard let model = VideoModelConfig.allModels.first(where: { $0.id == modelString }) else {
+                throw ToolError("Unknown model '\(modelString)'. Available: \(VideoModelConfig.allModels.map(\.id).joined(separator: ", "))")
             }
             return model.requiresSourceVideo
                 ? try generateVideoEdit(editor, args, prompt: prompt, model: model)
@@ -151,11 +156,44 @@ extension ToolExecutor {
         _ editor: EditorViewModel, _ args: [String: Any], prompt: String
     ) throws -> ToolResult {
         guard !prompt.isEmpty else { throw ToolError("Empty prompt") }
-        guard let modelId = args.string("model") ?? ImageModelConfig.allModels.first?.id else {
-            throw ToolError("Model catalog not loaded yet. Try again in a moment.")
+        let modelString = args.string("model") ?? (ImageModelConfig.allModels.first?.id ?? "flux")
+        let modelId = ModelID(string: modelString)
+        if modelId.isLocal {
+            let model = ImageModelConfig(
+                entry: CatalogEntry(from: ProviderModel(id: modelString, kind: .image)),
+                caps: ImageCaps.defaults
+            )
+            let aspectRatio = args.string("aspectRatio") ?? model.aspectRatios.first ?? ""
+            let resolution = args.string("resolution") ?? model.resolutions?.first
+            let quality = args.string("quality") ?? model.qualities?.last
+            let refIds = args.stringArray("referenceMediaRefs")
+            let refs: [MediaAsset] = try refIds.map { id in
+                let a = try asset(id, editor: editor, label: "Reference image")
+                guard a.type == .image else {
+                    throw ToolError("referenceMediaRefs entry '\(id)' must be an image asset (got \(a.type.rawValue))")
+                }
+                return a
+            }
+            let genInput = GenerationInput(
+                prompt: prompt, model: modelString, duration: 0,
+                aspectRatio: aspectRatio, resolution: resolution, quality: quality
+            )
+            let folderId = try resolveFolderId(args, editor: editor, fallbackReferences: refs)
+            let placeholderId = ImageGenerationSubmission.make(
+                genInput: genInput,
+                model: model,
+                references: refs,
+                name: args.string("name"),
+                folderId: folderId
+            ).submit(
+                service: editor.generationService,
+                projectURL: editor.projectURL,
+                editor: editor
+            )
+            return .ok("Generation started. Placeholder asset ID: \(placeholderId). Model: \(modelString), aspect: \(aspectRatio)")
         }
-        guard let model = ImageModelConfig.allModels.first(where: { $0.id == modelId }) else {
-            throw ToolError("Unknown model '\(modelId)'. Available: \(ImageModelConfig.allModels.map(\.id).joined(separator: ", "))")
+        guard let model = ImageModelConfig.allModels.first(where: { $0.id == modelString }) else {
+            throw ToolError("Unknown model '\(modelString)'. Available: \(ImageModelConfig.allModels.map(\.id).joined(separator: ", "))")
         }
         let aspectRatio = args.string("aspectRatio") ?? model.aspectRatios.first ?? ""
         let resolution = args.string("resolution") ?? model.resolutions?.first
@@ -176,7 +214,7 @@ extension ToolExecutor {
         }
 
         let genInput = GenerationInput(
-            prompt: prompt, model: modelId, duration: 0,
+            prompt: prompt, model: modelString, duration: 0,
             aspectRatio: aspectRatio, resolution: resolution, quality: quality
         )
         let folderId = try resolveFolderId(args, editor: editor, fallbackReferences: refs)
@@ -195,17 +233,28 @@ extension ToolExecutor {
     }
 
     func generateAudio(_ editor: EditorViewModel, _ args: [String: Any]) async throws -> ToolResult {
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Generation requires signing in to Palmier. Tell the user to sign in.")
+        guard ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled else {
+            throw ToolError("Generation requires an AI provider. Configure a base URL, API key, or enable Local AI in Settings.")
         }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
-        }
-        guard let modelId = args.string("model") ?? AudioModelConfig.allModels.first?.id else {
-            throw ToolError("Model catalog not loaded yet. Try again in a moment.")
-        }
-        guard let model = AudioModelConfig.allModels.first(where: { $0.id == modelId }) else {
-            throw ToolError("Unknown model '\(modelId)'. Available: \(AudioModelConfig.allModels.map(\.id).joined(separator: ", "))")
+        let modelString = args.string("model") ?? (AudioModelConfig.allModels.first?.id ?? "tts-1")
+        let modelId = ModelID(string: modelString)
+        let model: AudioModelConfig
+        if modelId.isLocal {
+            let category: AudioModelConfig.Category
+            switch modelId.localCategory {
+            case .music: category = .music
+            case .sfx:   category = .sfx
+            default:     category = .tts
+            }
+            model = AudioModelConfig(
+                entry: CatalogEntry(from: ProviderModel(id: modelString, kind: .tts)),
+                caps: AudioCaps.defaults(for: category)
+            )
+        } else {
+            guard let m = AudioModelConfig.allModels.first(where: { $0.id == modelString }) else {
+                throw ToolError("Unknown model '\(modelString)'. Available: \(AudioModelConfig.allModels.map(\.id).joined(separator: ", "))")
+            }
+            model = m
         }
 
         let prompt = (args.string("prompt") ?? "").trimmingCharacters(in: .whitespaces)
@@ -224,7 +273,7 @@ extension ToolExecutor {
             guard let fileURL = editor.mediaResolver.resolveURL(for: videoAsset.id) else {
                 throw ToolError("Could not read the video source file.")
             }
-            videoURL = try await GenerationBackend.uploadReference(fileURL: fileURL, contentType: "video/mp4")
+            videoURL = nil  // video references not supported by OpenAI-compatible providers
             spanSeconds = videoAsset.duration
         } else if let start = args.int("videoSourceStartFrame"), let end = args.int("videoSourceEndFrame") {
             guard acceptsVideo else {
@@ -239,7 +288,7 @@ extension ToolExecutor {
                 shortSide: 360, includeAudio: false
             )
             defer { try? FileManager.default.removeItem(at: mp4) }
-            videoURL = try await GenerationBackend.uploadReference(fileURL: mp4, contentType: "video/mp4")
+            videoURL = nil  // video references not supported by OpenAI-compatible providers
             spanSeconds = Double(end - start) / Double(max(1, editor.timeline.fps))
             placementStartFrame = start
         }
@@ -316,21 +365,26 @@ extension ToolExecutor {
         guard asset.type == .video || asset.type == .image else {
             throw ToolError("Upscale supports video and image assets only (got \(asset.type.rawValue))")
         }
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Upscale requires signing in to Palmier. Tell the user to sign in.")
-        }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
+        guard ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled else {
+            throw ToolError("Generation requires an AI provider. Configure a base URL, API key, or enable Local AI in Settings.")
         }
 
         let available = UpscaleModelConfig.models(for: asset.type)
         let model: UpscaleModelConfig
         if let requested = args.string("model") {
-            guard let match = available.first(where: { $0.id == requested }) else {
-                let ids = available.map(\.id).joined(separator: ", ")
-                throw ToolError("Model '\(requested)' does not support \(asset.type.rawValue). Available: \(ids)")
+            let modelId = ModelID(string: requested)
+            if modelId.isLocal {
+                model = UpscaleModelConfig(
+                    entry: CatalogEntry(from: ProviderModel(id: requested, kind: .upscale)),
+                    caps: UpscaleCaps.defaults
+                )
+            } else {
+                guard let match = available.first(where: { $0.id == requested }) else {
+                    let ids = available.map(\.id).joined(separator: ", ")
+                    throw ToolError("Model '\(requested)' does not support \(asset.type.rawValue). Available: \(ids)")
+                }
+                model = match
             }
-            model = match
         } else {
             guard let first = available.first else {
                 throw ToolError("No upscaler available for \(asset.type.rawValue)")

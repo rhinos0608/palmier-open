@@ -2,12 +2,14 @@ import Accelerate
 import Foundation
 
 enum VisualSearch {
-    struct Hit: Equatable {
+    struct Hit: Equatable, Identifiable {
         let assetID: String
         let time: Double
         let shotStart: Double
         let shotEnd: Double
         let score: Float
+
+        var id: String { "\(assetID):\(shotStart)" }
     }
 
     /// Top hits across assets, best-per-shot

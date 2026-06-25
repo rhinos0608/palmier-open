@@ -4,7 +4,6 @@ struct GenerationView: View {
     let maxPanelHeight: Double
 
     @Environment(EditorViewModel.self) var editor
-    @Bindable private var account = AccountService.shared
     @State private var prompt = ""
     @State private var selectedType: GenerationType = .video
     @State private var selectedVideoModelIndex = 0
@@ -362,33 +361,13 @@ struct GenerationView: View {
         }
     }
 
-    private var remainingCredits: Int? {
-        guard let budget = AccountService.shared.budgetCredits else { return nil }
-        return max(0, budget - AccountService.shared.spentCredits)
-    }
-
-    private var hasInsufficientCredits: Bool {
-        guard let cost = estimatedCost, let left = remainingCredits else { return false }
-        return cost > left
-    }
-
-    private var canAffordGeneration: Bool {
-        guard let left = remainingCredits else { return true }
-        if let cost = estimatedCost { return cost <= left }
-        return left > 0
-    }
+    private var canAffordGeneration: Bool { ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled }
 
     private var costHelpText: String {
         guard let cost = estimatedCost else {
             return "Estimated cost. Actual billing may differ slightly."
         }
-        guard let left = remainingCredits else {
-            return "\(cost) credits estimated. Actual billing may differ."
-        }
-        if cost > left {
-            return "\(cost) credits needed. Only \(left.formatted()) remaining."
-        }
-        return "\(cost) credits. \((left - cost).formatted()) credits remaining after this generation."
+        return "\(cost) credits estimated. Actual billing may differ."
     }
 
     private var settingsSummary: String {
@@ -436,7 +415,7 @@ struct GenerationView: View {
         }
     }
 
-    private var aiAllowed: Bool { account.aiAllowed }
+    private var aiAllowed: Bool { ProviderConfig.isConfigured || ProviderConfig.isLocalAIEnabled }
 
     private var catalogLoadingView: some View {
         VStack(spacing: AppTheme.Spacing.md) {
@@ -465,7 +444,6 @@ struct GenerationView: View {
             HStack(spacing: AppTheme.Spacing.sm) {
                 typeTabs
                 Spacer()
-                CreditSummaryView(style: .compact)
                 ProjectActivityButton()
                 Button {
                     editor.pendingEditReplacementClipId = nil
@@ -845,7 +823,7 @@ struct GenerationView: View {
                 .monospacedDigit()
                 .lineLimit(1)
         }
-        .foregroundStyle(hasInsufficientCredits ? .red : AppTheme.Text.secondaryColor)
+        .foregroundStyle(AppTheme.Text.secondaryColor)
         .help(costHelpText)
     }
 
@@ -1297,7 +1275,6 @@ struct GenerationView: View {
     private var submitButton: some View {
         Button {
             if aiAllowed { submitGeneration() }
-            else if !account.isMisconfigured { Task { await account.signInWithGoogle() } }
         } label: {
             Image(systemName: aiAllowed ? "arrow.up" : "person.crop.circle")
                 .font(.system(size: AppTheme.FontSize.sm, weight: .bold))
@@ -1307,9 +1284,9 @@ struct GenerationView: View {
         .buttonBorderShape(.circle)
         .controlSize(.regular)
         .tint(AppTheme.Accent.primary)
-        .disabled(aiAllowed ? !canSubmit : account.isMisconfigured)
-        .opacity((aiAllowed ? canSubmit : !account.isMisconfigured) ? 1 : AppTheme.Opacity.strong)
-        .help(aiAllowed ? "" : (account.isMisconfigured ? "AI is unavailable" : "Sign in to generate"))
+        .disabled(!aiAllowed || !canSubmit)
+        .opacity((aiAllowed && canSubmit) ? 1 : AppTheme.Opacity.strong)
+        .help(aiAllowed ? "" : "Configure an AI provider in Settings to generate.")
     }
 
     // MARK: - Type picker

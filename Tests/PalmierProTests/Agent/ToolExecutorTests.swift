@@ -102,8 +102,8 @@ struct ToolExecutorReadOnlyTests {
         #expect(json?["currentFrame"] as? Int == 42)
     }
 
-    @Test func getTimelineExposesCanGenerateFromAccountService() async throws {
-        // AccountService.shared starts unpaid in test environment.
+    @Test func getTimelineExposesCanGenerateFromProviderConfig() async throws {
+        // ProviderConfig.isConfigured defaults to false in test environment.
         let h = ToolHarness()
         let json = try await h.runOK("get_timeline") as? [String: Any]
         // We don't assert the value (depends on env), only that the key is present and Bool.

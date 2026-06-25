@@ -6,7 +6,7 @@ struct ImageGenerationSubmission {
     let name: String?
     let numImages: Int
     let folderId: String?
-    let buildParams: ([String]) -> BackendGenerationParams
+    let buildParams: ([String]) -> GenerationParams
 
     @MainActor
     @discardableResult

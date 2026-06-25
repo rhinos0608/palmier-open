@@ -1,0 +1,13 @@
+mlx-audio>=0.1.0
+mlx>=0.22.0
+numpy
+Pillow
+# music generation
+ace-step
+# sound effects
+git+https://github.com/declare-lab/TangoFlux
+# 2x image upscale
+pipersr
+# 4x image upscale
+realesrgan
+basicsr

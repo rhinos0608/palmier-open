@@ -102,6 +102,24 @@ struct MediaResolverTests {
         #expect(resolver.resolveURL(for: "a") == nil)
     }
 
+    @Test func resolveProjectRejectsPathTraversal() {
+        let projectDir = URL(fileURLWithPath: "/tmp/test-project")
+        let e = entry(id: "a", source: .project(relativePath: "../../etc/passwd"))
+        var manifest = MediaManifest()
+        manifest.entries = [e]
+        let resolver = MediaResolver(manifest: { manifest }, projectURL: { projectDir })
+        #expect(resolver.expectedURL(for: "a") == nil)
+    }
+
+    @Test func resolveProjectRejectsDeepPathTraversal() {
+        let projectDir = URL(fileURLWithPath: "/tmp/test-project")
+        let e = entry(id: "a", source: .project(relativePath: "subdir/../../../../etc/shadow"))
+        var manifest = MediaManifest()
+        manifest.entries = [e]
+        let resolver = MediaResolver(manifest: { manifest }, projectURL: { projectDir })
+        #expect(resolver.expectedURL(for: "a") == nil)
+    }
+
     // MARK: - Cache behavior
 
     @Test func entryCacheRebuildsWhenEntryCountChanges() {

@@ -2,57 +2,49 @@ import Foundation
 
 // MARK: - Shared value types
 
-enum AnthropicModel: String, CaseIterable, Sendable {
-    case sonnet46 = "claude-sonnet-4-6"
-    case opus48 = "claude-opus-4-8"
-    case haiku45 = "claude-haiku-4-5-20251001"
+enum AgentStopReason: Sendable {
+    case endTurn
+    case toolUse
+    case maxTokens
+    case other
 
-    var displayName: String {
-        switch self {
-        case .sonnet46: "Sonnet 4.6"
-        case .opus48: "Opus 4.8"
-        case .haiku45: "Haiku 4.5"
+    static func from(finishReason: String) -> AgentStopReason {
+        switch finishReason {
+        case "stop": return .endTurn
+        case "tool_calls", "function_call": return .toolUse
+        case "length": return .maxTokens
+        default: return .other
         }
     }
 }
 
-enum AnthropicStopReason: String, Sendable {
-    case endTurn = "end_turn"
-    case toolUse = "tool_use"
-    case maxTokens = "max_tokens"
-    case stopSequence = "stop_sequence"
-    case pauseTurn = "pause_turn"
-    case refusal = "refusal"
-    case other
+/// A fully-formed OpenAI chat message object (role + content + optional
+/// tool_calls / tool_call_id). Built by `AgentService` so each client stays thin.
+struct AgentWireMessage: @unchecked Sendable {
+    let json: [String: Any]
 }
 
-struct AnthropicMessage: @unchecked Sendable {
-    enum Role: String, Sendable { case user, assistant }
-    let role: Role
-    let content: [[String: Any]]
-}
-
-struct AnthropicToolSchema: @unchecked Sendable {
+struct AgentToolSchema: @unchecked Sendable {
     let name: String
     let description: String
     let inputSchema: [String: Any]
 }
 
-enum AnthropicStreamEvent: Sendable {
+enum AgentStreamEvent: Sendable {
     case textDelta(String)
     case toolUseComplete(id: String, name: String, inputJSON: String)
-    case messageStop(stopReason: AnthropicStopReason)
+    case messageStop(stopReason: AgentStopReason)
 }
 
-enum AnthropicClientError: LocalizedError {
-    case missingAPIKey
+enum AgentStreamError: LocalizedError {
+    case notConfigured
     case httpError(status: Int, body: String)
     case streamError(String)
 
     var errorDescription: String? {
         switch self {
-        case .missingAPIKey: "No Anthropic API key is set."
-        case .httpError(let status, let body): "Anthropic API error (\(status)): \(body.prefix(500))"
+        case .notConfigured: "Add an API base URL and key in Settings to start."
+        case .httpError(let status, let body): "Provider error (\(status)): \(body.prefix(500))"
         case .streamError(let msg): "Stream error: \(msg)"
         }
     }
@@ -63,9 +55,9 @@ enum AnthropicClientError: LocalizedError {
 protocol AgentClient: Sendable {
     func stream(
         system: String,
-        tools: [AnthropicToolSchema],
-        messages: [AnthropicMessage]
-    ) -> AsyncThrowingStream<AnthropicStreamEvent, Error>
+        tools: [AgentToolSchema],
+        messages: [AgentWireMessage]
+    ) -> AsyncThrowingStream<AgentStreamEvent, Error>
 }
 
 // MARK: - Usage logging
@@ -73,122 +65,114 @@ protocol AgentClient: Sendable {
 enum AgentUsageLog {
     static func record(_ usage: [String: Any]) {
         #if DEBUG
-        let input = usage["input_tokens"] as? Int ?? 0
-        let cacheWrite = usage["cache_creation_input_tokens"] as? Int ?? 0
-        let cacheRead = usage["cache_read_input_tokens"] as? Int ?? 0
-        let billed = input + cacheWrite + cacheRead
-        let readPct = billed > 0 ? Int((Double(cacheRead) / Double(billed)) * 100) : 0
-        print("[agent cache] input=\(input) cacheWrite=\(cacheWrite) cacheRead=\(cacheRead) (\(readPct)% read)")
+        let prompt = usage["prompt_tokens"] as? Int ?? 0
+        let completion = usage["completion_tokens"] as? Int ?? 0
+        print("[agent usage] prompt=\(prompt) completion=\(completion)")
         #endif
     }
 }
 
-// MARK: - Shared SSE parser
+// MARK: - OpenAI request body builder
 
-enum AnthropicSSE {
-    static func parse(
-        bytes: URLSession.AsyncBytes,
-        continuation: AsyncThrowingStream<AnthropicStreamEvent, Error>.Continuation
-    ) async throws {
-        var pendingTools: [Int: (id: String, name: String, json: String)] = [:]
-        for try await line in bytes.lines {
-            try Task.checkCancellation()
-            guard line.hasPrefix("data:"),
-                  let data = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces).data(using: .utf8),
-                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = event["type"] as? String else { continue }
+enum OpenAIRequestBody {
+    static func build(
+        model: String,
+        maxTokens: Int,
+        system: String,
+        tools: [AgentToolSchema],
+        messages: [AgentWireMessage]
+    ) -> [String: Any] {
+        var wire: [[String: Any]] = []
+        if !system.isEmpty {
+            wire.append(["role": "system", "content": system])
+        }
+        wire.append(contentsOf: messages.map(\.json))
 
-            switch type {
-            case "message_start":
-                if let message = event["message"] as? [String: Any],
-                   let usage = message["usage"] as? [String: Any] {
-                    AgentUsageLog.record(usage)
-                }
-
-            case "content_block_start":
-                if let index = event["index"] as? Int,
-                   let block = event["content_block"] as? [String: Any],
-                   block["type"] as? String == "tool_use",
-                   let id = block["id"] as? String,
-                   let name = block["name"] as? String {
-                    pendingTools[index] = (id, name, "")
-                }
-
-            case "content_block_delta":
-                guard let index = event["index"] as? Int,
-                      let delta = event["delta"] as? [String: Any],
-                      let deltaType = delta["type"] as? String else { break }
-                if deltaType == "text_delta", let text = delta["text"] as? String, !text.isEmpty {
-                    continuation.yield(.textDelta(text))
-                } else if deltaType == "input_json_delta",
-                          let partial = delta["partial_json"] as? String,
-                          var acc = pendingTools[index] {
-                    acc.json += partial
-                    pendingTools[index] = acc
-                }
-
-            case "content_block_stop":
-                if let index = event["index"] as? Int, let acc = pendingTools.removeValue(forKey: index) {
-                    let json = acc.json.isEmpty ? "{}" : acc.json
-                    continuation.yield(.toolUseComplete(id: acc.id, name: acc.name, inputJSON: json))
-                }
-
-            case "message_delta":
-                if let delta = event["delta"] as? [String: Any],
-                   let raw = delta["stop_reason"] as? String {
-                    continuation.yield(.messageStop(stopReason: AnthropicStopReason(rawValue: raw) ?? .other))
-                }
-
-            case "error":
-                if let err = event["error"] as? [String: Any],
-                   let msg = err["message"] as? String {
-                    continuation.finish(throwing: AnthropicClientError.streamError(msg))
-                }
-
-            default: break
+        var body: [String: Any] = [
+            "model": model,
+            "stream": true,
+            "stream_options": ["include_usage": true],
+            "max_tokens": maxTokens,
+            "messages": wire,
+        ]
+        if !tools.isEmpty {
+            body["tools"] = tools.map { tool in
+                [
+                    "type": "function",
+                    "function": [
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema,
+                    ],
+                ]
             }
         }
+        return body
     }
 }
 
-// MARK: - Request body builder
+// MARK: - Shared OpenAI SSE parser
 
-enum AnthropicRequestBody {
-    static func build(
-        model: AnthropicModel,
-        maxTokens: Int,
-        system: String,
-        tools: [AnthropicToolSchema],
-        messages: [AnthropicMessage]
-    ) -> [String: Any] {
-        var toolBlocks: [[String: Any]] = tools.map {
-            ["name": $0.name, "description": $0.description, "input_schema": $0.inputSchema]
+enum OpenAISSE {
+    static func parse(
+        bytes: URLSession.AsyncBytes,
+        continuation: AsyncThrowingStream<AgentStreamEvent, Error>.Continuation
+    ) async throws {
+        var pendingTools: [Int: (id: String, name: String, json: String)] = [:]
+
+        func flushTools() {
+            for (_, acc) in pendingTools.sorted(by: { $0.key < $1.key }) {
+                let json = acc.json.isEmpty ? "{}" : acc.json
+                continuation.yield(.toolUseComplete(id: acc.id, name: acc.name, inputJSON: json))
+            }
+            pendingTools.removeAll()
         }
-        // Prompt-cache boundary covers system + tools.
-        if var last = toolBlocks.popLast() {
-            last["cache_control"] = ["type": "ephemeral"]
-            toolBlocks.append(last)
+
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let data = payload.data(using: .utf8),
+                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            if let err = event["error"] as? [String: Any] {
+                let msg = (err["message"] as? String) ?? "unknown error"
+                continuation.finish(throwing: AgentStreamError.streamError(msg))
+                return
+            }
+
+            if let usage = event["usage"] as? [String: Any] {
+                AgentUsageLog.record(usage)
+            }
+
+            guard let choices = event["choices"] as? [[String: Any]],
+                  let choice = choices.first else { continue }
+
+            if let delta = choice["delta"] as? [String: Any] {
+                if let content = delta["content"] as? String, !content.isEmpty {
+                    continuation.yield(.textDelta(content))
+                }
+                if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                    for call in toolCalls {
+                        let index = call["index"] as? Int ?? 0
+                        var acc = pendingTools[index] ?? (id: "", name: "", json: "")
+                        if let id = call["id"] as? String, !id.isEmpty { acc.id = id }
+                        if let function = call["function"] as? [String: Any] {
+                            if let name = function["name"] as? String, !name.isEmpty { acc.name = name }
+                            if let args = function["arguments"] as? String { acc.json += args }
+                        }
+                        pendingTools[index] = acc
+                    }
+                }
+            }
+
+            if let finish = choice["finish_reason"] as? String, !finish.isEmpty {
+                flushTools()
+                continuation.yield(.messageStop(stopReason: AgentStopReason.from(finishReason: finish)))
+            }
         }
-        // Prompt-cache the conversation prefix
-        var messageBlocks: [[String: Any]] = messages.map {
-            ["role": $0.role.rawValue, "content": $0.content]
-        }
-        if var lastMsg = messageBlocks.popLast(),
-           var content = lastMsg["content"] as? [[String: Any]],
-           var lastBlock = content.popLast() {
-            lastBlock["cache_control"] = ["type": "ephemeral"]
-            content.append(lastBlock)
-            lastMsg["content"] = content
-            messageBlocks.append(lastMsg)
-        }
-        var body: [String: Any] = [
-            "model": model.rawValue,
-            "max_tokens": maxTokens,
-            "stream": true,
-            "system": [["type": "text", "text": system, "cache_control": ["type": "ephemeral"]]],
-            "messages": messageBlocks,
-        ]
-        if !toolBlocks.isEmpty { body["tools"] = toolBlocks }
-        return body
+        flushTools()
     }
 }

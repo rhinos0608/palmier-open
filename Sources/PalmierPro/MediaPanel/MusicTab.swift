@@ -2,7 +2,6 @@ import SwiftUI
 
 struct MusicTab: View {
     @Environment(EditorViewModel.self) var editor
-    @Bindable private var account = AccountService.shared
 
     @State private var selectedModelId: String?
     @State private var mode: MusicGenerationSubmission.Mode = .videoToMusic
@@ -66,9 +65,8 @@ struct MusicTab: View {
             }
             if let issue = model.validate(spanSeconds: spanSeconds) { return issue }
         }
-        if let cost = estimatedCost, cost > AccountService.shared.remainingCredits,
-           AccountService.shared.budgetCredits != nil {
-            return "\(cost) credits needed. Only \(AccountService.shared.remainingCredits.formatted()) remaining."
+        if !ProviderConfig.isConfigured(for: .music) {
+            return "Configure an AI provider in Settings to generate."
         }
         return nil
     }
@@ -223,11 +221,11 @@ struct MusicTab: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, AppTheme.Spacing.smMd)
                         .background(RoundedRectangle(cornerRadius: AppTheme.Radius.sm).fill(AppTheme.Accent.primary))
-                        .opacity((canGenerate && account.aiAllowed) ? AppTheme.Opacity.opaque : AppTheme.Opacity.medium)
+                        .opacity((canGenerate && ProviderConfig.isConfigured(for: .music)) ? AppTheme.Opacity.opaque : AppTheme.Opacity.medium)
                 }
                 .buttonStyle(.plain).focusable(false)
-                .disabled(!canGenerate || !account.aiAllowed)
-                .help(account.aiAllowed ? "" : "Sign in to generate")
+                .disabled(!canGenerate || !ProviderConfig.isConfigured(for: .music))
+                .help(ProviderConfig.isConfigured(for: .music) ? "" : "Configure an AI provider in Settings to generate.")
 
                 agentMenu
             }

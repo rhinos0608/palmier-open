@@ -21,8 +21,11 @@ final class MediaResolver: @unchecked Sendable {
         case .external(let absolutePath):
             return URL(fileURLWithPath: absolutePath)
         case .project(let relativePath):
-            guard let base = projectURL() else { return nil }
-            return base.appendingPathComponent(relativePath)
+            guard let base = projectURL()?.standardizedFileURL else { return nil }
+            let resolved = base.appendingPathComponent(relativePath).standardizedFileURL
+            let basePrefix = base.path + (base.path.hasSuffix("/") ? "" : "/")
+            guard resolved.path == base.path || resolved.path.hasPrefix(basePrefix) else { return nil }
+            return resolved
         }
     }
 

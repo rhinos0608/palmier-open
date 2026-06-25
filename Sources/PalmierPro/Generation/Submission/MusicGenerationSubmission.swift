@@ -44,10 +44,7 @@ struct MusicGenerationSubmission {
             )
             defer { try? FileManager.default.removeItem(at: mp4) }
             onPhase(.uploading)
-            videoURL = try await GenerationBackend.uploadReference(
-                fileURL: mp4,
-                contentType: "video/mp4"
-            )
+            videoURL = nil  // video references not supported by OpenAI-compatible providers
         }
 
         let durationSeconds = max(1, Int(spanSeconds.rounded()))

@@ -1,5 +1,4 @@
 import Foundation
-@preconcurrency import Combine
 
 /// Used by replace-clip callbacks so only the
 /// first successful asset of an N-image generation swaps the clip
@@ -16,8 +15,6 @@ final class FirstOnlyFlag {
 @MainActor
 final class GenerationService {
 
-    private static let uploadCacheTTL: TimeInterval = 6 * 24 * 60 * 60
-
     @discardableResult
     func generate(
         genInput: GenerationInput,
@@ -29,7 +26,7 @@ final class GenerationService {
         name: String? = nil,
         numImages: Int = 1,
         folderId: String? = nil,
-        buildParams: @escaping ([String]) -> BackendGenerationParams,
+        buildParams: @escaping ([String]) -> GenerationParams,
         snapshotRefs: (@Sendable (inout GenerationInput, [String]) -> Void)? = nil,
         preprocessRef: (@Sendable (Int, MediaAsset) async throws -> URL?)? = nil,
         fileExtension: String,
@@ -96,17 +93,10 @@ final class GenerationService {
                             }
                         }
                     }
-                    // Cache against the MediaAsset only when asset bytes are pristine (not trimmed, not preprocessed)
-                    let trimmedFirst = trimmedSourceOverride?.hasTrim == true
-                    let cacheKeys: [MediaAsset?] = references.enumerated().map { (i, asset) in
-                        if preprocessRef != nil { return nil }
-                        if i == 0 && trimmedFirst { return nil }
-                        return asset
-                    }
-                    uploaded = try await uploadReferences(
+                    // Encode reference images as base64 data URIs; skip video/audio refs.
+                    uploaded = await encodeReferences(
                         at: urlsToUpload,
                         types: refTypes,
-                        cacheKeys: cacheKeys,
                     )
                 }
 
@@ -224,44 +214,26 @@ final class GenerationService {
         }
     }
 
-    /// Uploads each reference and returns the hosted URLs.
-    private func uploadReferences(
+    /// Encodes reference images as base64 data URIs. The first reference is always encoded
+    /// (needed for upscale source). Additional video/audio references are skipped.
+    private func encodeReferences(
         at urls: [URL],
         types: [ClipType],
-        cacheKeys: [MediaAsset?],
-    ) async throws -> [String] {
-        guard !urls.isEmpty else { return [] }
-        return try await withThrowingTaskGroup(of: (Int, String).self) { group in
-            for (i, url) in urls.enumerated() {
-                let type = types.indices.contains(i) ? types[i] : .image
-                let cacheKey = cacheKeys.indices.contains(i) ? cacheKeys[i] : nil
-                if let cacheKey, let hit = cacheKey.freshRemoteURL {
-                    group.addTask { (i, hit) }
-                    continue
-                }
-                let contentType = Self.contentType(for: url, fallback: type)
-                group.addTask {
-                    let uploaded = try await GenerationBackend.uploadReference(
-                        fileURL: url,
-                        contentType: contentType,
-                    )
-                    if let cacheKey {
-                        await Self.recordUploadCache(asset: cacheKey, url: uploaded)
-                    }
-                    return (i, uploaded)
-                }
-            }
-            var results = [(Int, String)]()
-            for try await r in group { results.append(r) }
-            return results.sorted(by: { $0.0 < $1.0 }).map(\.1)
+    ) async -> [String] {
+        var out: [String] = []
+        for (i, url) in urls.enumerated() {
+            let type = types.indices.contains(i) ? types[i] : .image
+            let isFirst = i == 0
+            guard isFirst || type == .image else { continue }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let mime = Self.contentType(for: url, fallback: type)
+            let b64 = data.base64EncodedString()
+            out.append("data:\(mime);base64,\(b64)")
         }
+        return out
     }
 
-    @MainActor
-    private static func recordUploadCache(asset: MediaAsset, url: String) {
-        asset.cachedRemoteURL = url
-        asset.cachedRemoteURLExpiresAt = Date().addingTimeInterval(uploadCacheTTL)
-    }
+// MARK: - Content type helpers
 
     private static func contentType(for url: URL, fallback: ClipType) -> String {
         switch url.pathExtension.lowercased() {
@@ -290,7 +262,7 @@ final class GenerationService {
 
     private func runJob(
         placeholders: [MediaAsset],
-        params: BackendGenerationParams,
+        params: GenerationParams,
         genInput: GenerationInput,
         editor: EditorViewModel,
         onComplete: (@MainActor (MediaAsset) -> Void)?,
@@ -300,110 +272,311 @@ final class GenerationService {
         Log.generation.notice("run \(runId) start model=\(genInput.model) placeholders=\(placeholders.count)")
         defer { Log.generation.notice("run \(runId) settled") }
 
-        let jobId: String
+        let hasRemote = ProviderConfig.isConfigured
+        let hasLocal = ProviderConfig.isLocalAIEnabled
+        guard hasRemote || hasLocal else {
+            for placeholder in placeholders {
+                placeholder.generationStatus = .failed("No AI provider configured. Enable Local AI or set a base URL in Settings.")
+            }
+            onFailure?()
+            return
+        }
+
         do {
-            jobId = try await GenerationBackend.submit(
-                model: genInput.model,
-                params: params,
-                projectId: editor.projectId,
-            )
+            switch params {
+            case .video(let p):
+                try await runVideoJob(params: p, genInput: genInput, placeholders: placeholders,
+                                      editor: editor, onComplete: onComplete, onFailure: onFailure)
+            case .image(let p):
+                try await runImageJob(params: p, genInput: genInput, placeholders: placeholders,
+                                      editor: editor, onComplete: onComplete, onFailure: onFailure)
+            case .audio(let p):
+                try await runAudioJob(params: p, genInput: genInput, placeholders: placeholders,
+                                      editor: editor, onComplete: onComplete, onFailure: onFailure)
+            case .upscale(let p):
+                try await runUpscaleJob(params: p, genInput: genInput, placeholders: placeholders,
+                                        editor: editor, onComplete: onComplete, onFailure: onFailure)
+            }
         } catch {
             let message = error.localizedDescription
-            Log.generation.error("submit failed model=\(genInput.model) error=\(message)")
+            Log.generation.error("job failed model=\(genInput.model) error=\(message)")
             for placeholder in placeholders {
                 placeholder.generationStatus = .failed(message)
             }
             onFailure?()
-            return
         }
+    }
 
-        guard let publisher = GenerationBackend.subscribe(jobId: jobId) else {
+    // MARK: - Per-type job runners
+
+    private func runVideoJob(
+        params: VideoGenerationParams, genInput: GenerationInput,
+        placeholders: [MediaAsset], editor: EditorViewModel,
+        onComplete: (@MainActor (MediaAsset) -> Void)?, onFailure: (@MainActor () -> Void)?
+    ) async throws {
+        let imageRef = genInput.imageURLs?.first
+        let (b64, mime): (String?, String?) = parseDataURI(imageRef)
+        let resolution = params.resolution ?? GenerationCapabilities.videoDefaultSize
+
+        // Local sync path: adapter returns data directly.
+        if ProviderConfig.isLocalMode(for: .video),
+           let localModel = ProviderConfig.selectedLocalModel(for: .video),
+           let adapter = GenerationProvider.localAdapter,
+           adapter.serverManager.isRunningValue {
+            let data = try await adapter.generateVideo(
+                model: localModel, prompt: params.prompt,
+                seconds: params.duration, size: resolution
+            )
             for placeholder in placeholders {
-                placeholder.generationStatus = .failed("Backend not configured")
+                try data.write(to: placeholder.url)
+                placeholder.generationStatus = .none
+                editor.importMediaAsset(placeholder, skipAppend: true)
+                editor.appendGenerationLog(for: placeholder)
+                await editor.finalizeImportedAsset(placeholder)
+                onComplete?(placeholder)
             }
-            onFailure?()
             return
         }
 
-        let stream = AsyncStream<BackendGenerationJob?> { continuation in
-            let cancellable = publisher
-                .receive(on: DispatchQueue.main)
-                .sink(
-                    receiveCompletion: { _ in continuation.finish() },
-                    receiveValue: { value in continuation.yield(value) },
+        let job = try await GenerationProvider.createVideo(
+            model: genInput.model, prompt: params.prompt,
+            seconds: params.duration, size: resolution,
+            imageRefBase64: b64, imageRefMime: mime
+        )
+        try await pollAndFinalize(job: job, placeholders: placeholders, editor: editor,
+                                  poll: { try await GenerationProvider.getVideo(jobId: $0) },
+                                  download: { try await GenerationProvider.downloadVideoContent(jobId: $0) },
+                                  onComplete: onComplete, onFailure: onFailure)
+    }
+
+    private func runImageJob(
+        params: ImageGenerationParams, genInput: GenerationInput,
+        placeholders: [MediaAsset], editor: EditorViewModel,
+        onComplete: (@MainActor (MediaAsset) -> Void)?, onFailure: (@MainActor () -> Void)?
+    ) async throws {
+        let response = try await GenerationProvider.generateImage(
+            model: genInput.model, prompt: params.prompt,
+            size: params.resolution ?? "1024x1024",
+            n: min(params.numImages, placeholders.count),
+            quality: params.quality ?? "standard",
+            imageURLs: params.imageURLs
+        )
+        var allSucceeded = true
+        for (i, img) in response.images.enumerated() {
+            guard i < placeholders.count else { break }
+            let placeholder = placeholders[i]
+            if let b64 = img.b64JSON, let data = Data(base64Encoded: b64) {
+                try data.write(to: placeholder.url)
+                placeholder.generationStatus = .none
+                editor.importMediaAsset(placeholder, skipAppend: true)
+                editor.appendGenerationLog(for: placeholder)
+                await editor.finalizeImportedAsset(placeholder)
+                onComplete?(placeholder)
+            } else if let urlStr = img.url, let remote = URL(string: urlStr) {
+                let ok = await downloadAndFinalize(asset: placeholder, remoteURL: remote, editor: editor)
+                if ok {
+                    onComplete?(placeholder)
+                } else {
+                    allSucceeded = false
+                }
+            } else {
+                placeholder.generationStatus = .failed("No image data in response")
+                allSucceeded = false
+            }
+        }
+        if response.images.count < placeholders.count {
+            for i in response.images.count..<placeholders.count {
+                placeholders[i].generationStatus = .failed("Provider returned fewer images than requested")
+            }
+            allSucceeded = false
+        }
+        if !allSucceeded {
+            onFailure?()
+        }
+    }
+
+    private func runAudioJob(
+        params: AudioGenerationParams, genInput: GenerationInput,
+        placeholders: [MediaAsset], editor: EditorViewModel,
+        onComplete: (@MainActor (MediaAsset) -> Void)?, onFailure: (@MainActor () -> Void)?
+    ) async throws {
+        let category: AudioModelConfig.Category = {
+            let modelId = ModelID(string: genInput.model)
+            if modelId.isLocal {
+                switch modelId.localCategory {
+                case .music: return .music
+                case .sfx:   return .sfx
+                default:     return .tts
+                }
+            }
+            if let kind = ModelCatalog.shared.byId[genInput.model] {
+                if case let .audio(config) = kind { return config.category }
+            }
+            return params.instrumental ? .music : .tts
+        }()
+
+        switch category {
+        case .tts:
+            let voice = params.voice ?? GenerationCapabilities.ttsDefaultVoice
+            let data = try await GenerationProvider.speech(
+                model: genInput.model, input: params.prompt, voice: voice
+            )
+            for placeholder in placeholders {
+                try data.write(to: placeholder.url)
+                placeholder.generationStatus = .none
+                editor.importMediaAsset(placeholder, skipAppend: true)
+                editor.appendGenerationLog(for: placeholder)
+                await editor.finalizeImportedAsset(placeholder)
+                onComplete?(placeholder)
+            }
+        case .sfx:
+            let data = try await GenerationProvider.generateSFX(
+                model: genInput.model, prompt: params.prompt,
+                durationSeconds: Double(params.durationSeconds ?? GenerationCapabilities.sfxDefaultDuration)
+            )
+            for placeholder in placeholders {
+                try data.write(to: placeholder.url)
+                placeholder.generationStatus = .none
+                editor.importMediaAsset(placeholder, skipAppend: true)
+                editor.appendGenerationLog(for: placeholder)
+                await editor.finalizeImportedAsset(placeholder)
+                onComplete?(placeholder)
+            }
+        case .music:
+            // Local sync path: adapter returns data directly.
+            if ProviderConfig.isLocalMode(for: .music),
+               let localModel = ProviderConfig.selectedLocalModel(for: .music),
+               let adapter = GenerationProvider.localAdapter,
+               adapter.serverManager.isRunningValue {
+                let data = try await adapter.generateMusic(
+                    model: localModel, prompt: params.prompt,
+                    durationSeconds: params.durationSeconds ?? 30,
+                    instrumental: params.instrumental
                 )
-            continuation.onTermination = { _ in cancellable.cancel() }
+                for placeholder in placeholders {
+                    try data.write(to: placeholder.url)
+                    placeholder.generationStatus = .none
+                    editor.importMediaAsset(placeholder, skipAppend: true)
+                    editor.appendGenerationLog(for: placeholder)
+                    await editor.finalizeImportedAsset(placeholder)
+                    onComplete?(placeholder)
+                }
+                return
+            }
+
+            let job = try await GenerationProvider.createMusic(
+                model: genInput.model, prompt: params.prompt,
+                durationSeconds: params.durationSeconds ?? 30,
+                instrumental: params.instrumental, style: params.styleInstructions
+            )
+            try await pollAndFinalize(job: job, placeholders: placeholders, editor: editor,
+                                      poll: { try await GenerationProvider.getMusicJob(jobId: $0) },
+                                      download: { try await GenerationProvider.downloadMusicContent(jobId: $0) },
+                                      onComplete: onComplete, onFailure: onFailure)
+        }
+    }
+
+    private func runUpscaleJob(
+        params: UpscaleGenerationParams, genInput: GenerationInput,
+        placeholders: [MediaAsset], editor: EditorViewModel,
+        onComplete: (@MainActor (MediaAsset) -> Void)?, onFailure: (@MainActor () -> Void)?
+    ) async throws {
+        let (b64, mime) = parseDataURI(params.sourceURL)
+        guard let b64, let mime else {
+            throw ProviderError.unexpectedResponse("upscale — no valid source image")
         }
 
-        for await jobOpt in stream {
-            guard let job = jobOpt else { continue }
-            switch job.status {
-            case .succeeded:
-                await finalizeSuccess(
-                    job: job,
-                    placeholders: placeholders,
-                    editor: editor,
-                    onComplete: onComplete,
-                    onFailure: onFailure,
-                )
+        // Local sync path: adapter returns data directly.
+        if ProviderConfig.isLocalMode(for: .upscale),
+           let localModel = ProviderConfig.selectedLocalModel(for: .image),
+           let adapter = GenerationProvider.localAdapter,
+           adapter.serverManager.isRunningValue {
+            let data = try await adapter.generateUpscale(
+                model: localModel, imageBase64: b64, imageMime: mime, scale: 2
+            )
+            for placeholder in placeholders {
+                try data.write(to: placeholder.url)
+                placeholder.generationStatus = .none
+                editor.importMediaAsset(placeholder, skipAppend: true)
+                editor.appendGenerationLog(for: placeholder)
+                await editor.finalizeImportedAsset(placeholder)
+                onComplete?(placeholder)
+            }
+            return
+        }
+
+        let job = try await GenerationProvider.createUpscale(
+            model: genInput.model, imageBase64: b64, imageMime: mime
+        )
+        try await pollAndFinalize(job: job, placeholders: placeholders, editor: editor,
+                                  poll: { try await GenerationProvider.getUpscaleJob(jobId: $0) },
+                                  download: { try await GenerationProvider.downloadUpscaleContent(jobId: $0) },
+                                  onComplete: onComplete, onFailure: onFailure)
+    }
+
+    // MARK: - Shared async job poller
+
+    private func pollAndFinalize(
+        job: AsyncJob,
+        placeholders: [MediaAsset],
+        editor: EditorViewModel,
+        poll: @escaping (String) async throws -> AsyncJob,
+        download: @escaping (String) async throws -> Data,
+        onComplete: (@MainActor (MediaAsset) -> Void)?,
+        onFailure: (@MainActor () -> Void)?
+    ) async throws {
+        var current = job
+        while true {
+            try Task.checkCancellation()
+            switch current.status {
+            case .completed:
+                if let urlStr = current.resultURL, let remote = URL(string: urlStr) {
+                    var allSucceeded = true
+                    for placeholder in placeholders {
+                        let ok = await downloadAndFinalize(asset: placeholder, remoteURL: remote, editor: editor)
+                        if ok {
+                            onComplete?(placeholder)
+                        } else {
+                            allSucceeded = false
+                        }
+                    }
+                    if !allSucceeded {
+                        onFailure?()
+                    }
+                } else {
+                    let data = try await download(current.id)
+                    for placeholder in placeholders {
+                        try data.write(to: placeholder.url)
+                        placeholder.generationStatus = .none
+                        editor.importMediaAsset(placeholder, skipAppend: true)
+                        editor.appendGenerationLog(for: placeholder)
+                        await editor.finalizeImportedAsset(placeholder)
+                        onComplete?(placeholder)
+                    }
+                }
                 return
             case .failed:
-                let message = job.errorMessage ?? "Generation failed"
-                Log.generation.error("job \(jobId) failed: \(message)")
+                let msg = current.error ?? "Generation failed"
                 for placeholder in placeholders {
-                    placeholder.generationStatus = .failed(message)
+                    placeholder.generationStatus = .failed(msg)
                 }
                 onFailure?()
                 return
-            case .queued, .running:
-                continue
+            case .queued, .inProgress:
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                current = try await poll(current.id)
             }
         }
     }
 
-    private func finalizeSuccess(
-        job: BackendGenerationJob,
-        placeholders: [MediaAsset],
-        editor: EditorViewModel,
-        onComplete: (@MainActor (MediaAsset) -> Void)?,
-        onFailure: (@MainActor () -> Void)?
-    ) async {
-        let urlStrings = job.resultUrls ?? []
-        guard !urlStrings.isEmpty else {
-            Log.generation.error("backend job succeeded with no resultUrls")
-            for placeholder in placeholders {
-                placeholder.generationStatus = .failed("No URL in response")
-            }
-            onFailure?()
-            return
-        }
-        if urlStrings.count < placeholders.count {
-            Log.generation.notice("backend returned \(urlStrings.count) URL(s) for \(placeholders.count) placeholder(s); marking extras as failed")
-        }
-
-        var finalized: [MediaAsset] = []
-        for (i, placeholder) in placeholders.enumerated() {
-            guard i < urlStrings.count, let remote = URL(string: urlStrings[i]) else {
-                placeholder.generationStatus = .failed("No URL for placeholder")
-                continue
-            }
-            if await downloadAndFinalize(asset: placeholder, remoteURL: remote, editor: editor) {
-                onComplete?(placeholder)
-                finalized.append(placeholder)
-            }
-        }
-
-        if let first = finalized.first {
-            AppNotifications.generationComplete(
-                assetId: first.id,
-                projectURL: editor.projectURL,
-                assetName: first.name,
-                assetType: first.type,
-                count: finalized.count
-            )
-        } else {
-            onFailure?()
-        }
+    private func parseDataURI(_ s: String?) -> (base64: String?, mime: String?) {
+        guard let s, s.hasPrefix("data:") else { return (nil, nil) }
+        let stripped = String(s.dropFirst("data:".count))
+        guard let commaIdx = stripped.firstIndex(of: ",") else { return (nil, nil) }
+        let mediaType = String(stripped[..<commaIdx])
+        let mime = mediaType.components(separatedBy: ";").first ?? mediaType
+        let b64 = String(stripped[stripped.index(after: commaIdx)...])
+        return (b64, mime)
     }
 
 }

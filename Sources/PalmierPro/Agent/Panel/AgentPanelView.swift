@@ -137,14 +137,14 @@ struct AgentPanelView: View {
 
     @ViewBuilder
     private var modelPicker: some View {
-        if service.hasApiKey {
+        if service.isConfigured {
             Menu {
                 ForEach(service.availableModels, id: \.self) { m in
-                    Button(m.displayName) { service.model = m }
+                    Button(m) { service.model = m }
                 }
             } label: {
                 HStack(spacing: AppTheme.Spacing.xs) {
-                    Text(service.effectiveModel.displayName)
+                    Text(service.model.isEmpty ? "Select model" : service.model)
                         .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
                         .foregroundStyle(AppTheme.Text.secondaryColor)
                     Image(systemName: "chevron.down")
@@ -160,11 +160,11 @@ struct AgentPanelView: View {
 
     @ViewBuilder
     private var byokIndicator: some View {
-        if service.hasApiKey {
-            Text("using API key")
+        if service.isConfigured {
+            Text("using provider")
                 .font(.system(size: AppTheme.FontSize.xs).italic())
                 .foregroundStyle(AppTheme.Text.tertiaryColor)
-                .help("Streaming through your Anthropic API key (BYOK)")
+                .help("Streaming through your configured AI provider")
         }
     }
 
@@ -277,18 +277,14 @@ struct AgentPanelView: View {
         let action: () -> Void
     }
 
-    private func errorCTA(for error: PalmierClientError?) -> ErrorCTA? {
+    private func errorCTA(for error: AgentStreamError?) -> ErrorCTA? {
         guard let error else { return nil }
         switch error {
-        case .unauthenticated:
-            return ErrorCTA(title: "Sign in") {
-                SettingsWindowController.shared.show(tab: .account)
+        case .notConfigured:
+            return ErrorCTA(title: "Open Settings") {
+                SettingsWindowController.shared.show(tab: .agent)
             }
-        case .insufficientCredits:
-            return ErrorCTA(title: "View plans") {
-                SettingsWindowController.shared.show(tab: .account)
-            }
-        case .upstream:
+        case .httpError, .streamError:
             return nil
         }
     }
@@ -316,32 +312,13 @@ struct AgentPanelView: View {
 
     @ViewBuilder
     private var missingKeyState: some View {
-        let account = AccountService.shared
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Button(action: { SettingsWindowController.shared.show(tab: .account) }) {
-                Text(missingKeyPrimaryAction(account: account))
-                    .underline()
-                    .foregroundStyle(AppTheme.Accent.primary)
-            }
-            .buttonStyle(.plain)
-
-            Text("or use")
-                .foregroundStyle(AppTheme.Text.tertiaryColor)
-
-            Button(action: { SettingsWindowController.shared.show(tab: .agent) }) {
-                Text("your own Anthropic key")
-                    .underline()
-                    .foregroundStyle(AppTheme.Accent.primary)
-            }
-            .buttonStyle(.plain)
+        Button(action: { SettingsWindowController.shared.show(tab: .agent) }) {
+            Text("Add an API base URL and key in Settings")
+                .underline()
+                .foregroundStyle(AppTheme.Accent.primary)
         }
+        .buttonStyle(.plain)
         .font(.system(size: AppTheme.FontSize.md, weight: .medium))
-    }
-
-    private func missingKeyPrimaryAction(account: AccountService) -> String {
-        if !account.isSignedIn { return "Sign in" }
-        if !account.isPaid { return "Subscribe" }
-        return "Open Settings"
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
