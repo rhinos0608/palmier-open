@@ -33,3 +33,10 @@ models/*/.venv/
 models/*/build*/
 models/*/checkpoint*
 models/*/convert*.log
+
+# Agent / tool artifacts
+.pi-smartread/
+.pi-smartread.tags.cache/
+.smart-edit-undo/
+.research/
+research.md

@@ -129,7 +129,3 @@ final class HelpWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 }
-
-#Preview {
-    HelpView()
-}

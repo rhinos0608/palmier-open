@@ -3,11 +3,10 @@ import AppKit
 Log.bootstrap()
 Telemetry.start()
 BundledFonts.register()
-AccountService.shared.configure()
 ModelCatalog.shared.configure()
 
 // Shorten the default tooltip delay from 2s to 0.01s.
-UserDefaults.standard.set(10, forKey: "NSInitialToolTipDelay")
+UserDefaults.standard.set(0.01, forKey: "NSInitialToolTipDelay")
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

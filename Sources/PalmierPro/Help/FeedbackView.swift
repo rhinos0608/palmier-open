@@ -2,7 +2,6 @@ import AppKit
 import SwiftUI
 
 struct FeedbackView: View {
-    @Bindable private var account = AccountService.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var message: String = ""
@@ -30,10 +29,7 @@ struct FeedbackView: View {
         email.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var hasReplyEmail: Bool {
-        if account.isSignedIn { return account.account?.user.email != nil }
-        return !trimmedEmail.isEmpty
-    }
+    private var hasReplyEmail: Bool { !trimmedEmail.isEmpty }
 
     private var canSubmit: Bool {
         !isSending
@@ -62,9 +58,7 @@ struct FeedbackView: View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.lg) {
             descriptionField
 
-            if !account.isSignedIn {
-                emailField
-            }
+            emailField
 
             mayContactRow
 
@@ -176,11 +170,7 @@ struct FeedbackView: View {
     }
 
     private var contextNoteText: String {
-        if account.isSignedIn {
-            return "App version \(Self.appVersion) and macOS \(Self.osVersion) are included."
-        } else {
-            return "App version \(Self.appVersion) and macOS \(Self.osVersion) are included."
-        }
+        "App version \(Self.appVersion) and macOS \(Self.osVersion) are included."
     }
 
     private var footer: some View {
@@ -234,8 +224,7 @@ struct FeedbackView: View {
     }
 
     private var successDetailText: String {
-        let replyAddr = account.account?.user.email
-            ?? (trimmedEmail.isEmpty ? nil : trimmedEmail)
+        let replyAddr = trimmedEmail.isEmpty ? nil : trimmedEmail
         if let replyAddr, mayContact {
             return "We read every message and may reach out at \(replyAddr)."
         }
@@ -257,23 +246,8 @@ struct FeedbackView: View {
         guard canSubmit else { return }
         errorText = nil
         isSending = true
-        Task { @MainActor in
-            defer { isSending = false }
-            do {
-                let attachedScreenshot = (includeScreenshot ? screenshot : nil)?.base64EncodedString()
-                try await account.sendFeedback(
-                    message: trimmedMessage,
-                    email: trimmedEmail.isEmpty ? nil : trimmedEmail,
-                    mayContact: hasReplyEmail ? mayContact : false,
-                    screenshotPngBase64: attachedScreenshot,
-                    appVersion: Self.appVersion,
-                    osVersion: Self.osVersion
-                )
-                didSend = true
-            } catch {
-                errorText = error.localizedDescription
-            }
-        }
+        errorText = "Feedback sending is not available in this build."
+        isSending = false
     }
 
     // MARK: - Environment info
@@ -332,8 +306,4 @@ final class FeedbackWindowController: NSWindowController {
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-}
-
-#Preview {
-    FeedbackView(screenshot: nil)
 }

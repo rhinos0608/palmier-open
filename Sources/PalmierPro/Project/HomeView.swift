@@ -145,40 +145,18 @@ private struct NewProjectCard: View {
 }
 
 private struct WelcomeTitle: View {
-    @Bindable private var account = AccountService.shared
-
     var body: some View {
-        Text(title)
+        Text("Welcome to Palmier Pro")
             .font(.system(size: AppTheme.FontSize.title2, weight: .light))
             .tracking(AppTheme.Tracking.tight)
             .foregroundStyle(AppTheme.Text.primaryColor)
     }
-
-    private var title: String {
-        if let first = account.account?.user.firstName {
-            return "Welcome to Palmier Pro, \(first)"
-        }
-        return "Welcome to Palmier Pro"
-    }
 }
 
 private struct HomeSidebar: View {
-    @Bindable private var account = AccountService.shared
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if account.isSignedIn {
-                IdentityStrip()
-            }
-
             VStack(alignment: .leading, spacing: 2) {
-                if !account.isSignedIn && !account.isMisconfigured {
-                    SidebarRowButton(
-                        label: "Sign in with Google",
-                        systemImage: "person.crop.circle",
-                        action: { Task { await account.signInWithGoogle() } }
-                    )
-                }
                 SidebarRowButton(
                     label: "New Project",
                     systemImage: "plus",

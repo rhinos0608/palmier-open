@@ -109,9 +109,3 @@ struct ShortcutGroup {
     let title: String
     let shortcuts: [(String, String)]
 }
-
-#Preview {
-    ShortcutsPane()
-        .frame(width: 700, height: 520)
-        .background(AppTheme.Background.surfaceColor)
-}
